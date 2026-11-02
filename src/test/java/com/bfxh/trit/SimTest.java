@@ -10,6 +10,7 @@ import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Tri;
 import com.bfxh.trit.core.Vote;
 import com.bfxh.trit.core.WorldView;
+import com.bfxh.trit.neo.ProjectilePredictor;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -37,6 +38,13 @@ public final class SimTest {
         hazardOverridesPatrol();
         hungryEats();
         unknownThreatStandsStill();
+
+        dodgeMovesLegsNotHead();
+        dodgeBraceWhenPointBlank();
+        bGradeIsSilent();
+        unknownProjectileDoesNotMoveAnything();
+        dodgeKeepsForageVotes();
+        humanTakeoverYieldsMachine();
 
         System.out.println();
         System.out.println("行为仿真：" + passed + " 通过 / " + failed + " 失败");
@@ -156,6 +164,98 @@ public final class SimTest {
     }
 
     // ------------------------------------------------------------------
+    // 弹幕（R4 / R5 的验收）：动腿不动头，B 级静默，未知不动，且不顶掉原任务
+
+    /** 一份「A 级弹正对着来」的快照。 */
+    private static WorldView incoming(int dodgeAction, float tti) {
+        WorldView w = base();
+        w.projThreat = Tri.POS;
+        w.projectileCount = 1;
+        w.projectileAGrade = 1;
+        w.projTti = tti;
+        w.projCpa = 0.4f;
+        w.projBand = 1.0f;
+        w.projSigma = 0.08f;
+        w.projKind = "arrow";
+        w.dodgeAction = dodgeAction;
+        // 微调档：待命扫视这时不该动真实镜头，测试才能把「视角零变化」钉死
+        w.camBudgetLevel = 1;
+        return w;
+    }
+
+    /** 验收 1：朝玩家飞的箭 → 出躲避票；真实视角一拍都不动（比「≤2°/拍」更严）。 */
+    private static void dodgeMovesLegsNotHead() {
+        WorldView w = incoming(ProjectilePredictor.DODGE_RIGHT, 12f);
+        Decision d = run(w);
+        eq("弹幕来袭：横移", Tri.POS, d.dirs[Channel.STRAFE.index()]);
+        eq("弹幕来袭：不转头（YAW 零票）", Tri.ZERO, d.dirs[Channel.YAW.index()]);
+        eq("弹幕来袭：不点头（PITCH 零票）", Tri.ZERO, d.dirs[Channel.PITCH.index()]);
+        eq("弹幕来袭：阶段不变", Phase.IDLE, d.phase);
+    }
+
+    /** 贴脸弹（TTI ≤ 4 拍）额外来一跳：让开判定线 / 卸力。 */
+    private static void dodgeBraceWhenPointBlank() {
+        WorldView w = incoming(ProjectilePredictor.DODGE_RIGHT, 3f);
+        Decision d = run(w);
+        eq("贴脸弹：跳", Tri.POS, d.dirs[Channel.JUMP.index()]);
+    }
+
+    /** 验收 2：平行飞过 / 打不到的弹 → 零票、零视角，巡逻照常。 */
+    private static void bGradeIsSilent() {
+        WorldView w = base();
+        w.projThreat = Tri.NEG;
+        w.projectileCount = 3;
+        w.projectileAGrade = 0;
+        w.dodgeAction = ProjectilePredictor.DODGE_NONE;
+        Decision d = run(w);
+        eq("B 级：不横移", Tri.ZERO, d.dirs[Channel.STRAFE.index()]);
+        eq("B 级：不跳", Tri.ZERO, d.dirs[Channel.JUMP.index()]);
+        eq("B 级：巡逻照常", Tri.POS, d.dirs[Channel.FORWARD.index()]);
+    }
+
+    /** 验收 3：没扫描 = 未知，绝不能当成「没有弹」而起跳。 */
+    private static void unknownProjectileDoesNotMoveAnything() {
+        WorldView w = base();
+        w.projThreat = Tri.ZERO;
+        w.projectileCount = null;
+        Decision d = run(w);
+        eq("未扫描：不因弹幕动腿", Tri.ZERO, d.dirs[Channel.STRAFE.index()]);
+        eq("未扫描：不因弹幕跳", Tri.ZERO, d.dirs[Channel.JUMP.index()]);
+        eq("未扫描：巡逻照常", Tri.POS, d.dirs[Channel.FORWARD.index()]);
+    }
+
+    /** 验收 4：躲避期间采集票不清空，躲完接着干活。 */
+    private static void dodgeKeepsForageVotes() {
+        WorldView w = incoming(ProjectilePredictor.DODGE_RIGHT, 10f);
+        w.resourcePos = new int[]{5, 64, 12};
+        w.resourceDist = 6f;
+        w.wood = 6f;
+        w.yawToResource = 0f;
+        w.pitchToResource = 0f;
+        List<Vote> votes = votesOf(w, Mode.FORAGE);
+        check("躲避时采集票还在", hasSrc(votes, "forage_walk"));
+        check("躲避时躲避票也在", hasSrc(votes, "dodge_right"));
+        Decision d = run(w, Mode.FORAGE);
+        eq("躲避方向压过侧移", Tri.POS, d.dirs[Channel.STRAFE.index()]);
+        eq("前进没被清空（继续走向树）", Tri.POS, d.dirs[Channel.FORWARD.index()]);
+    }
+
+    /**
+     * 验收 5：玩家操作时让权。
+     * 真实路径是 {@code TritMod} 里 {@code humanActing → detach}；这里钉的是机器侧的等价闸门
+     * （{@code humanTakeover}），保证即使调用方漏判，状态机也不会在这拍写出任何动作。
+     */
+    private static void humanTakeoverYieldsMachine() {
+        WorldView w = incoming(ProjectilePredictor.DODGE_RIGHT, 8f);
+        w.humanTakeover = true;
+        Decision d = run(w);
+        eq("让权：阶段交还", Phase.OFF, d.phase);
+        eq("让权：不前进", Tri.ZERO, d.dirs[Channel.FORWARD.index()]);
+        eq("让权：不横移", Tri.ZERO, d.dirs[Channel.STRAFE.index()]);
+        eq("让权：不动视角", Tri.ZERO, d.dirs[Channel.YAW.index()]);
+    }
+
+    // ------------------------------------------------------------------
 
     /** 一份「安全、无目标」的基础快照。 */
     private static WorldView base() {
@@ -193,6 +293,26 @@ public final class SimTest {
         boolean[] on = new boolean[Channel.NCH];
         java.util.Arrays.fill(on, true);
         return m.step(w, votes, on);
+    }
+
+    /** 只跑投票、不裁决：用来断言「某个模块的票在不在」。 */
+    private static List<Vote> votesOf(WorldView w, Mode mode) {
+        Machine m = new Machine();
+        m.setArmed(true);
+        Phase phase = m.peek(w);
+        Behavior.Ctx ctx = new Behavior.Ctx(w, phase, m, 1L, mode);
+        List<Vote> votes = new ArrayList<>();
+        for (Behavior b : Behaviors.defaults(new Behaviors.Anchor())) {
+            b.vote(ctx, votes);
+        }
+        return votes;
+    }
+
+    private static boolean hasSrc(List<Vote> votes, String src) {
+        for (Vote v : votes) {
+            if (src.equals(v.src)) return true;
+        }
+        return false;
     }
 
     private static void eq(String what, Object expect, Object actual) {

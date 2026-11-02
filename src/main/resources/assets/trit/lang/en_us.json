@@ -4,5 +4,17 @@
   "key.trit.halt": "Emergency stop",
   "key.trit.view": "Toggle view control",
   "key.trit.attack": "Toggle attack",
-  "key.trit.move": "Toggle movement"
+  "key.trit.move": "Toggle movement",
+  "key.trit.camera": "Camera budget level (how much view the AI may take)",
+  "key.trit.menu": "Radial menu",
+  "key.trit.menu.prev": "Radial: previous",
+  "key.trit.menu.next": "Radial: next",
+  "key.trit.menu.confirm": "Radial: confirm",
+  "key.trit.menu.cancel": "Radial: cancel",
+  "key.trit.menu.d0": "Radial: jump to 1",
+  "key.trit.menu.d1": "Radial: jump to 2",
+  "key.trit.menu.d2": "Radial: jump to 3",
+  "key.trit.menu.d3": "Radial: jump to 4",
+  "key.trit.menu.d4": "Radial: jump to 5",
+  "key.trit.menu.d5": "Radial: jump to 6"
 }

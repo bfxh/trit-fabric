@@ -3,6 +3,8 @@ package com.bfxh.trit.sense;
 import com.bfxh.trit.core.Angles;
 import com.bfxh.trit.core.Tri;
 import com.bfxh.trit.core.WorldView;
+import com.bfxh.trit.neo.Ballistics.Kind;
+import com.bfxh.trit.neo.ProjectilePredictor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.AbstractClientPlayer;
@@ -13,6 +15,17 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.projectile.EyeOfEnder;
+import net.minecraft.world.entity.projectile.FishingHook;
+import net.minecraft.world.entity.projectile.FireworkRocketEntity;
+import net.minecraft.world.entity.projectile.Projectile;
+import net.minecraft.world.entity.projectile.ShulkerBullet;
+import net.minecraft.world.entity.projectile.ThrowableProjectile;
+import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
+import net.minecraft.world.entity.projectile.arrow.ThrownTrident;
+import net.minecraft.world.entity.projectile.hurtingprojectile.AbstractHurtingProjectile;
+import net.minecraft.world.entity.projectile.hurtingprojectile.DragonFireball;
+import net.minecraft.world.entity.projectile.hurtingprojectile.windcharge.AbstractWindCharge;
 import net.minecraft.world.item.ArrowItem;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.BowItem;
@@ -53,6 +66,8 @@ public final class Sensor {
     private static final int ENEMY_PERIOD = 2;
     /** 资源每 10 拍扫一次（0.5 秒）。 */
     private static final int RESOURCE_PERIOD = 10;
+    /** 弹幕扫描半径（格）：弹速快，32 格足够给出 2 秒以上的提前量。 */
+    private static final float PROJECTILE_RADIUS = 32f;
 
     // ---- 方块分类表。用反射按字段名建立，避免逐个写常量导致版本漂移 ----
     private static final Set<Block> LOGS = new HashSet<>();
@@ -67,6 +82,28 @@ public final class Sensor {
 
     /** 跟随目标：玩家在环盘菜单里用准星指定的实体 id；null = 还没指定，用默认（最近玩家）。 */
     private Integer forcedFollowId;
+
+    /** 弹幕预测器（算 + 学）：纯逻辑，不碰 MC，可在离线测试里单独喂。 */
+    private final ProjectilePredictor projectiles = new ProjectilePredictor();
+    /** 遮挡判定回调：复用同一个实例，避免每拍产生垃圾。 */
+    private final Occlusion occlusion = new Occlusion();
+    /** 玩家上一拍的 hurtTime，用于「刚被打到」的边沿检测。 */
+    private int lastHurtTime;
+    /** 上一拍最危险那颗弹的类型，用来把这次挨打归给当时选错的躲避方向。 */
+    private Kind lastWorstKind;
+
+    /** 「这条弹道在我之前会不会先撞墙」—— 用方块查询回答。 */
+    private final class Occlusion implements ProjectilePredictor.PathCheck {
+        ClientLevel level;
+
+        @Override
+        public boolean blocked(double[] from, double[] to) {
+            if (level == null) return false;
+            return lineBlocked(level,
+                    new Vec3(from[0], from[1], from[2]),
+                    new Vec3(to[0], to[1], to[2]), null);
+        }
+    }
 
     /** 目标上一拍坐标，用于预测其速度并提前量瞄准（打移动目标）。 */
     private final Map<Integer, double[]> lastTargetPos = new HashMap<>();
@@ -263,6 +300,8 @@ public final class Sensor {
         attachTerrainTo(w);
         scanInteractionAndGear(mc, level, p, w);
         scanFollowTarget(level, p, w);
+        scanSelfMotionAndCamera(mc, p, w);
+        scanProjectiles(level, p, w, tick);
 
         // 准星所指方块的角度与可挖性（卡住开路用）
         if (w.frontPos != null) {
@@ -309,6 +348,9 @@ public final class Sensor {
         hasLast = false;
         lastTargetPos.clear();
         lastTargetTick.clear();
+        projectiles.reset();
+        lastWorstKind = null;
+        lastHurtTime = 0;
     }
 
     /**
@@ -719,5 +761,102 @@ public final class Sensor {
         float[] rel = relativeAngles(p, xyz[0], xyz[1], xyz[2]);
         w.followYaw = rel[0];
         w.followPitch = rel[1];
+    }
+
+    // ------------------------------------------------------------------
+    // 自身运动 + 相机模式（弹幕外推要把「我在往哪走」算进去，视角指标要报「第几视角」）
+    // ------------------------------------------------------------------
+
+    private void scanSelfMotionAndCamera(Minecraft mc, LocalPlayer p, WorldView w) {
+        Vec3 v = p.getDeltaMovement();
+        w.vel = new double[]{v.x, v.y, v.z};
+        w.horizSpeed = (float) Math.sqrt(v.x * v.x + v.z * v.z);
+        try {
+            w.camMode = mc.options.getCameraType().ordinal();
+        } catch (Exception ignore) {
+            w.camMode = null;   // 读不到就是未知，不能当成第一人称
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 弹幕：每拍扫一遍在飞的弹射物，喂给预测器，拿回分级与躲避方向。
+    // 全程不转视角、不锁目标、不播报 —— R4/R5 的「不看、不找、不说」。
+    // ------------------------------------------------------------------
+
+    private void scanProjectiles(ClientLevel level, LocalPlayer p, WorldView w, long tick) {
+        occlusion.level = level;
+
+        // 上一拍选了方向、这一拍挨打了 ⇒ 归因给当时最危险那颗弹的类型
+        if (p.hurtTime > lastHurtTime && lastWorstKind != null) {
+            projectiles.onPlayerHurt(lastWorstKind, tick);
+        }
+        lastHurtTime = p.hurtTime;
+
+        final double mx = p.getX();
+        final double my = p.getY() + p.getBbHeight() * 0.5;
+        final double mz = p.getZ();
+        final double r2 = (double) PROJECTILE_RADIUS * PROJECTILE_RADIUS;
+        int seen = 0;
+        for (Entity e : level.entitiesForRendering()) {
+            if (e == p) continue;
+            Kind k = kindOf(e, p);
+            if (k == null) continue;
+            if (e.distanceToSqr(mx, my, mz) > r2) continue;
+            if (++seen > ProjectilePredictor.MAX_TRACKS) break;
+            Vec3 v = e.getDeltaMovement();
+            projectiles.observe(e.getId(), k, e.getX(), e.getY(), e.getZ(), v.x, v.y, v.z, tick);
+        }
+
+        ProjectilePredictor.Assessment a =
+                projectiles.assess(new double[]{mx, my, mz}, w.vel, p.getYRot(), tick, occlusion, true);
+
+        w.projThreat = a.level;
+        w.projectileCount = a.count;
+        w.projectileAGrade = a.aGrade;
+        w.projTti = a.tti < 0 ? null : (float) a.tti;
+        w.projCpa = a.cpa == Double.MAX_VALUE ? null : (float) a.cpa;
+        w.projBand = (float) a.band;
+        w.projSigma = (float) a.sigma;
+        w.projKind = a.kind == null ? null : a.kind.name().toLowerCase(java.util.Locale.ROOT);
+        if (a.worstPosKnown) {
+            float[] rel = relativeAngles(p, a.worstPos[0], a.worstPos[1], a.worstPos[2]);
+            w.yawToProj = rel[0];
+            w.pitchToProj = rel[1];
+        } else {
+            w.yawToProj = null;
+            w.pitchToProj = null;
+        }
+        w.dodgeAction = a.dodge;
+        w.dodgeMargin = a.dodge == ProjectilePredictor.DODGE_NONE ? null : (float) a.dodgeMargin;
+        w.projLearned = a.learned;
+        lastWorstKind = a.level == Tri.POS ? a.kind : null;
+    }
+
+    /**
+     * 弹射物分类：认不出来的普通 {@code Projectile} 按 {@link Kind#UNKNOWN} 处理
+     * （照样外推，靠学到的残差纠偏）；不伤害人的（钓鱼竿浮漂、之眼）与自己射出的直接不算来袭。
+     *
+     * <p>用 {@code instanceof} 而不是 {@code getClass().getSimpleName()}：正式环境里类名是混淆的，
+     * 按名字匹配会在上线后静默退化成「一律 UNKNOWN」。
+     */
+    private static Kind kindOf(Entity e, LocalPlayer p) {
+        if (!(e instanceof Projectile pr)) return null;
+        if (e instanceof FishingHook || e instanceof EyeOfEnder) return null;
+        Entity owner = pr.getOwner();
+        if (owner == p) return null;
+        if (e instanceof ThrownTrident) return Kind.TRIDENT;
+        if (e instanceof AbstractArrow) return Kind.ARROW;
+        if (e instanceof ShulkerBullet) return Kind.SHULKER_BULLET;
+        if (e instanceof DragonFireball) return Kind.DRAGON_FIREBALL;
+        if (e instanceof AbstractWindCharge) return Kind.WIND_CHARGE;
+        if (e instanceof AbstractHurtingProjectile) return Kind.FIREBALL;
+        if (e instanceof ThrowableProjectile) return Kind.THROWN;
+        if (e instanceof FireworkRocketEntity) return Kind.FIREWORK;
+        return Kind.UNKNOWN;
+    }
+
+    /** 弹幕预测器（供测试与调试读数）。 */
+    public ProjectilePredictor projectiles() {
+        return projectiles;
     }
 }

@@ -32,8 +32,10 @@ public final class TritHud implements HudElement {
     @Override
     public void extractRenderState(GuiGraphicsExtractor g, DeltaTracker dt) {
         if (!mod.isMenuOpen()) {
-            // 非菜单时也画跟随指向箭头（轻量，不动其它 UI）
+            // 非菜单时也画：跟随指向箭头 + 视角归属徽标 + 来袭方位刻痕（都轻量，不动其它 UI）
             drawFollowArrow(g);
+            drawCameraBadge(g);
+            drawIncomingTick(g);
             return;
         }
 
@@ -118,6 +120,46 @@ public final class TritHud implements HudElement {
         drawLine(g, ax, ay, ax - dy, ay + dx, 0xFF7CFC00, 4);
         drawLine(g, ax, ay, ax + dy, ay - dx, 0xFF7CFC00, 4);
         g.centeredText(mc.font, "跟随目标 →", cx, cy - r - 18, 0xFF7CFC00);
+    }
+
+    // ------------------------------------------------------------------
+    // 视角归属 / 来袭方位（AI 接管期间常驻，菜单打开时不画）
+
+    /**
+     * 左上角一行：现在是第几视角、AI 有多少镜头预算、本拍它到底动了没有。
+     * 你要的「知道 AI 在看第 3 还是第 1 视角」就是这个。
+     */
+    private void drawCameraBadge(GuiGraphicsExtractor g) {
+        if (!mod.isArmed()) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.font == null) return;
+        String line = mod.cameraHint();
+        // AI 没动镜头 = 绿（视角归你）；动了 = 黄（有预算才动）
+        int color = line.contains("归你") ? 0xFF6BE38A : 0xFFFFD166;
+        g.text(mc.font, line, 4, 4, color, true);
+    }
+
+    /**
+     * 来袭方位刻痕：在准星外圈画一道短痕，指向 A 级弹幕的方向。
+     *
+     * <p>它替代「转头去看」—— 方位是内部算出来的，画在屏幕上就够，
+     * 镜头一个度都不会为弹幕动（R4）。
+     */
+    private void drawIncomingTick(GuiGraphicsExtractor g) {
+        Float yaw = mod.incomingYawHint();
+        if (yaw == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.font == null) return;
+        int cx = g.guiWidth() / 2;
+        int cy = g.guiHeight() / 2;
+        double a = Math.toRadians(yaw);
+        int r0 = 26, r1 = 40;
+        int x0 = cx + (int) (Math.sin(a) * r0);
+        int y0 = cy - (int) (Math.cos(a) * r0);
+        int x1 = cx + (int) (Math.sin(a) * r1);
+        int y1 = cy - (int) (Math.cos(a) * r1);
+        drawLine(g, x0, y0, x1, y1, 0xFFFF5A5A, 3);
+        g.text(mc.font, mod.projectileHint(), 4, 16, 0xFFFF9A9A, true);
     }
 
     // ------------------------------------------------------------------

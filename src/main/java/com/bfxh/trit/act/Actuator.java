@@ -1,6 +1,7 @@
 package com.bfxh.trit.act;
 
 import com.bfxh.trit.core.Channel;
+import com.bfxh.trit.core.CameraBudget;
 import com.bfxh.trit.core.Decision;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Tri;
@@ -57,6 +58,27 @@ public final class Actuator {
     private ClientInput saved = null;
     private boolean attached;
 
+    /** 摄像头预算闸门；null = 不做限制（离线路径 / 单测）。 */
+    private CameraBudget budget;
+
+    /** 由 TritMod 注入：视角写入统一过这一层，AI 才有「自己选择调与不调」但受限制的镜头。 */
+    public void setCameraBudget(CameraBudget budget) {
+        this.budget = budget;
+    }
+
+    public CameraBudget cameraBudget() {
+        return budget;
+    }
+
+    /** 第三人称请求：AI 判断「换个机位能看清大概范围」时才提，档位不够直接拒绝。 */
+    public boolean requestPerspective(Minecraft mc, net.minecraft.client.CameraType want) {
+        if (budget == null || want == null) return false;
+        if (!budget.allowsPerspectiveSwitch()) return false;
+        if (mc == null || mc.options == null || mc.options.getCameraType() == want) return false;
+        mc.options.setCameraType(want);
+        return true;
+    }
+
     /** 攻击冷却拍数，避免每拍都点。 */
     private int attackCooldown;
     /** 上一次挖掘的目标，用来判断是不是换了个方块。 */
@@ -97,6 +119,8 @@ public final class Actuator {
         attackCooldown = 0;
         bowing = false;
         bowCharge = 0;
+        // 交还控制权 = 镜头锚点作废：下次接管从玩家当前视角重新起算，不欠预算。
+        if (budget != null) budget.reanchor();
     }
 
     /**
@@ -164,21 +188,50 @@ public final class Actuator {
         Float guide = null;
         if (d.phase == Phase.ENGAGE && w.targetId >= 0) guide = w.yawToTarget;
         else if (d.attackHold) guide = w.yawToResource;
+
+        float wantYaw = 0f;
+        float wantPitch = 0f;
         if (yawCh != Tri.ZERO) {
             float step = YAW_RATE;
             if (guide != null) step = Math.min(YAW_RATE, Math.max(1.5f, Math.abs(guide) * 0.35f));
-            p.setYRot(p.getYRot() + yawCh.toInt() * step);
+            wantYaw = yawCh.toInt() * step;
         }
         if (pitchCh != Tri.ZERO) {
             float step = PITCH_RATE;
             if (guide != null) step = Math.min(PITCH_RATE, Math.max(1.2f, Math.abs(guide) * 0.3f));
-            float np = p.getXRot() + pitchCh.toInt() * step;
-            p.setXRot(Math.max(-89f, Math.min(89f, np)));
+            wantPitch = pitchCh.toInt() * step;
         }
-        // 待命/扫视时把俯仰慢慢拉平，别一直盯着地面或天空（「视角往地下看」的残留根因）
-        if (guide == null && !d.attackHold && Math.abs(p.getXRot()) > 0.5f) {
-            float step = Math.min(PITCH_RATE, Math.max(1f, Math.abs(p.getXRot()) * 0.25f));
-            p.setXRot(p.getXRot() - Math.signum(p.getXRot()) * step);
+
+        // 摄像头预算闸门：AI「想转」不等于「能转」。档位、锚点、剩余幅度都归 CameraBudget 判，
+        // 玩家自己动的镜头会把锚点带走（所以「我调摄像头不影响它」，也不会有人跟你抢方向盘）。
+        float wroteYaw = budget != null ? budget.clampYaw(p.getYRot(), wantYaw) : wantYaw;
+        float wrotePitch = budget != null ? budget.clampPitch(p.getXRot(), wantPitch) : wantPitch;
+        if (wroteYaw != 0f) p.setYRot(p.getYRot() + wroteYaw);
+        if (wrotePitch != 0f) p.setXRot(clampPitch(p.getXRot() + wrotePitch));
+
+        // 本拍没有任何视角意图 → 「用完就还」：把镜头收回锚点（玩家视角），而不是停在 AI 拧歪的地方。
+        if (guide == null && !d.attackHold) {
+            if (budget != null) {
+                float rcYaw = budget.recenterYaw(p.getYRot());
+                float rcPitch = budget.recenterPitch(p.getXRot());
+                if (rcYaw != 0f) {
+                    p.setYRot(p.getYRot() + rcYaw);
+                    wroteYaw += rcYaw;
+                }
+                if (rcPitch != 0f) {
+                    p.setXRot(clampPitch(p.getXRot() + rcPitch));
+                    wrotePitch += rcPitch;
+                }
+            } else if (Math.abs(p.getXRot()) > 0.5f) {
+                // 没有闸门时的老行为：把俯仰拉平（离线路径保留）
+                float step = Math.min(PITCH_RATE, Math.max(1f, Math.abs(p.getXRot()) * 0.25f));
+                wrotePitch = -Math.signum(p.getXRot()) * step;
+                p.setXRot(clampPitch(p.getXRot() + wrotePitch));
+            }
+        }
+
+        if (budget != null) {
+            budget.observeCamera(p.getYRot(), p.getXRot(), wroteYaw, wrotePitch);
         }
 
         if (d.phase == Phase.RECOVER) {
@@ -387,6 +440,11 @@ public final class Actuator {
             }
         }
         return false;
+    }
+
+    /** 俯仰硬边界（±89°），防止把相机翻转。 */
+    private static float clampPitch(float p) {
+        return Math.max(-89f, Math.min(89f, p));
     }
 
     /** 从玩家大致指向目标方块的那个面，用于 {@code startDestroyBlock}。 */

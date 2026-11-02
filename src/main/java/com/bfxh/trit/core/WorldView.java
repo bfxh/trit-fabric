@@ -133,6 +133,63 @@ public final class WorldView {
     /** 跟随目标相对当前视线的俯仰角差（度，正 = 在下方）。null = 无。 */
     public Float followPitch;
 
+    // ---- 运动（弹幕外推要把「我自己往哪走」一起算进去）----
+
+    /** 我的速度向量 {@code [vx,vy,vz]}（格/拍）。null = 还没读到，<strong>不是「静止」</strong>。 */
+    public double[] vel;
+    /** 水平速度（格/拍）。null = 未知。 */
+    public Float horizSpeed;
+
+    // ---- 弹幕（R4 / R5：内部算完直接躲，不看、不找、不说）----
+
+    /** 弹幕威胁级：POS = 有 A 级来袭；NEG = 扫过了、明确没有；ZERO = 没扫描 = 未知。 */
+    public Tri projThreat = Tri.ZERO;
+    /** 窗口内在飞的弹射物数量。null = 没扫描。 */
+    public Integer projectileCount;
+    /** 其中 A 级（需响应）的数量。null = 没扫描。 */
+    public Integer projectileAGrade;
+    /** 最危险那颗的命中时间（拍）。null = 打不到我。 */
+    public Float projTti;
+    /** 最危险那颗的最近接近距离（格）。 */
+    public Float projCpa;
+    /** 那颗的预测波动带（格）= 判据里「预测」那一半的宽度。 */
+    public Float projBand;
+    /** 那颗类型的每拍残差波动（格）。学到的，不是设的。 */
+    public Float projSigma;
+    /** 那颗的类型名（arrow / trident / fireball / thrown / ...）。 */
+    public String projKind;
+    /** 那颗相对当前朝向的水平角差（度，正 = 在右边）。null = 无 A 级弹。 */
+    public Float yawToProj;
+    /** 那颗相对当前视线的俯仰角差（度，正 = 在下方）。null = 无 A 级弹。 */
+    public Float pitchToProj;
+    /** 建议躲避动作：0 左 1 右 2 后退 3 前进 4 跳，-1 = 无。 */
+    public int dodgeAction = -1;
+    /** 按建议动作躲之后的最近余量（格）。 */
+    public Float dodgeMargin;
+    /** 累计学习样本数，用来在指标里看「它到底学会没有」。 */
+    public Long projLearned;
+
+    // ---- 摄像头所有权 / 预算 / 独立指针 ----
+
+    /** 相机模式：0 = 第一人称，1 = 第三人称背，2 = 第三人称前。null = 未知。 */
+    public Integer camMode;
+    /** 摄像头预算档位：0 关 / 1 微调 / 2 跟踪 / 3 自由。 */
+    public int camBudgetLevel = 2;
+    /** 本拍 AI 写出去的水平视角增量（度，绝对值）。验收「弹幕来袭 ≤2°/拍」看它。 */
+    public float camAppliedYaw;
+    /** 本拍 AI 写出去的俯仰增量（度，绝对值）。 */
+    public float camAppliedPitch;
+    /** AI 视角偏离锚点的度数（带符号，正 = 右/下）。 */
+    public float camDeviation;
+    /** 被预算夹掉的累计度数：限制真起作用的证据。 */
+    public float camClippedTotal;
+    /** 独立指针（AI 自己的准星）朝向。 */
+    public Float pointerYaw;
+    /** 独立指针俯仰。 */
+    public Float pointerPitch;
+    /** 独立指针与真实视线的夹角（度）。 */
+    public Float pointerToCamera;
+
     public long tick;
 
     /**
@@ -197,19 +254,65 @@ public final class WorldView {
         c.followXyz = followXyz == null ? null : followXyz.clone();
         c.followYaw = followYaw;
         c.followPitch = followPitch;
+        c.vel = vel == null ? null : vel.clone();
+        c.horizSpeed = horizSpeed;
+        c.projThreat = projThreat;
+        c.projectileCount = projectileCount;
+        c.projectileAGrade = projectileAGrade;
+        c.projTti = projTti;
+        c.projCpa = projCpa;
+        c.projBand = projBand;
+        c.projSigma = projSigma;
+        c.projKind = projKind;
+        c.yawToProj = yawToProj;
+        c.pitchToProj = pitchToProj;
+        c.dodgeAction = dodgeAction;
+        c.dodgeMargin = dodgeMargin;
+        c.projLearned = projLearned;
+        c.camMode = camMode;
+        c.camBudgetLevel = camBudgetLevel;
+        c.camAppliedYaw = camAppliedYaw;
+        c.camAppliedPitch = camAppliedPitch;
+        c.camDeviation = camDeviation;
+        c.camClippedTotal = camClippedTotal;
+        c.pointerYaw = pointerYaw;
+        c.pointerPitch = pointerPitch;
+        c.pointerToCamera = pointerToCamera;
         c.tick = tick;
         return c;
     }
 
     /** 一行摘要，用于 action bar 与日志。 */
     public String summary() {
-        StringBuilder s = new StringBuilder(64);
+        StringBuilder s = new StringBuilder(96);
         s.append(hp == null ? "hp?" : String.format("hp%.0f%%", hp * 100f));
         s.append(' ').append(threat.ch()).append("威胁");
         if (dist != null) s.append(String.format(" d%.1f", dist));
         if (enemies != null) s.append(" x").append(enemies);
         if (hazard == Tri.POS) s.append(" !危险");
         if (stuck) s.append(" 卡住");
+        // 弹幕：只在 A 级时展开细节，B 级只报个数（用户要求「不说」——不播报，指标行不算播报）
+        if (projThreat == Tri.POS) {
+            s.append(" !弹").append(projKind == null ? "?" : projKind);
+            s.append(projTti == null ? "" : String.format(" tti%.0f", projTti));
+            s.append(projCpa == null ? "" : String.format(" cpa%.1f", projCpa));
+            s.append(projBand == null ? "" : String.format("/带%.1f", projBand));
+        } else if (projectileCount != null && projectileCount > 0) {
+            s.append(" 弹").append(projectileCount).append("(B)");
+        }
+        // 视角归属指标：现在是第几视角 + 预算档位
+        s.append(" 镜").append(camModeName(camMode)).append("/档").append(camBudgetLevel);
         return s.toString();
+    }
+
+    /** 相机模式的人类可读名：一 / 三后 / 三前 / ?（未知）。 */
+    public static String camModeName(Integer mode) {
+        if (mode == null) return "?";
+        return switch (mode) {
+            case 0 -> "一";
+            case 1 -> "三后";
+            case 2 -> "三前";
+            default -> String.valueOf(mode + 1);
+        };
     }
 }

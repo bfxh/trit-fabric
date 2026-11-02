@@ -4,5 +4,17 @@
   "key.trit.halt": "急停（全部松手）",
   "key.trit.view": "视角控制开关",
   "key.trit.attack": "攻击开关",
-  "key.trit.move": "移动开关"
+  "key.trit.move": "移动开关",
+  "key.trit.camera": "摄像头预算档位（AI 能动多少视角）",
+  "key.trit.menu": "环盘菜单",
+  "key.trit.menu.prev": "环盘：上一项",
+  "key.trit.menu.next": "环盘：下一项",
+  "key.trit.menu.confirm": "环盘：确认",
+  "key.trit.menu.cancel": "环盘：取消",
+  "key.trit.menu.d0": "环盘：直达 1",
+  "key.trit.menu.d1": "环盘：直达 2",
+  "key.trit.menu.d2": "环盘：直达 3",
+  "key.trit.menu.d3": "环盘：直达 4",
+  "key.trit.menu.d4": "环盘：直达 5",
+  "key.trit.menu.d5": "环盘：直达 6"
 }

@@ -5,6 +5,7 @@ import com.bfxh.trit.core.Mode;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Tri;
 import com.bfxh.trit.core.Vote;
+import com.bfxh.trit.neo.ProjectilePredictor;
 
 import java.util.List;
 
@@ -317,6 +318,8 @@ public final class Behaviors {
             if (c.phase != Phase.IDLE) return;
             if (c.w.resourcePos != null) return;
             if (c.w.targetId >= 0) return;
+            // 预算不够（关 / 微调档）就别用真实镜头扫视：改由独立指针看，镜头归玩家。
+            if (c.w.camBudgetLevel < 2) return;
             // 平滑扫视：正弦来回，约 6 秒一圈，自然回到正前方，不会卡在某个死角。
             double v = Math.cos(c.tick * 0.025);
             out.add(Vote.of(Channel.YAW, v >= 0 ? Tri.POS : Tri.NEG, 3, "idle_scan"));
@@ -487,10 +490,53 @@ public final class Behaviors {
         }
     }
 
+    /**
+     * 躲弹幕：A 级才动，而且<strong>只动腿不动头</strong>。
+     *
+     * <p>R4 的口径是「人被射时是感觉到了直接躲，不是先回头看一眼再躲」，所以这里
+     * 一条 YAW / PITCH 票都不投 —— 摄像头所有权不被弹幕消耗。
+     *
+     * <p>权重取 5：压过巡逻（3）、采集接近（4），压不过脚下岩浆（6）和低血撤退
+     * （阶段机直接强制后退）。躲完票自然消失，原任务继续。
+     */
+    public static final class DodgeProjectile implements Behavior {
+        @Override
+        public String name() {
+            return "dodge";
+        }
+
+        @Override
+        public void vote(Behavior.Ctx c, List<Vote> out) {
+            if (c.w.projThreat != Tri.POS) return;   // B 级或未知：零票、零视角
+            if (c.phase == Phase.RECOVER) return;
+            switch (c.w.dodgeAction) {
+                case ProjectilePredictor.DODGE_LEFT ->
+                        out.add(Vote.of(Channel.STRAFE, Tri.NEG, 5, "dodge_left"));
+                case ProjectilePredictor.DODGE_RIGHT ->
+                        out.add(Vote.of(Channel.STRAFE, Tri.POS, 5, "dodge_right"));
+                case ProjectilePredictor.DODGE_BACK ->
+                        out.add(Vote.of(Channel.FORWARD, Tri.NEG, 5, "dodge_back"));
+                case ProjectilePredictor.DODGE_FWD ->
+                        out.add(Vote.of(Channel.FORWARD, Tri.POS, 5, "dodge_fwd"));
+                case ProjectilePredictor.DODGE_JUMP ->
+                        out.add(Vote.of(Channel.JUMP, Tri.POS, 5, "dodge_jump"));
+                default -> {
+                    return;
+                }
+            }
+            // 贴脸弹（不到 4 拍就到）再加一跳卸力 / 让开判定线
+            if (c.w.projTti != null && c.w.projTti <= 4
+                    && c.w.dodgeAction != ProjectilePredictor.DODGE_JUMP) {
+                out.add(Vote.of(Channel.JUMP, Tri.POS, 3, "dodge_brace"));
+            }
+        }
+    }
+
     /** 组装默认行为链。顺序不影响结果：裁决只看权重和方向。 */
     public static Behavior[] defaults(Anchor anchor) {
         return new Behavior[]{
                 new HazardAvoid(),
+                new DodgeProjectile(),
                 new Combat(),
                 new Flee(),
                 new Eat(),

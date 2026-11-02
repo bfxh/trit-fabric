@@ -3,6 +3,7 @@ package com.bfxh.trit;
 import com.bfxh.trit.act.Actuator;
 import com.bfxh.trit.behave.Behavior;
 import com.bfxh.trit.behave.Behaviors;
+import com.bfxh.trit.core.CameraBudget;
 import com.bfxh.trit.core.Channel;
 import com.bfxh.trit.core.Decision;
 import com.bfxh.trit.core.Machine;
@@ -10,6 +11,7 @@ import com.bfxh.trit.core.Mode;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Vote;
 import com.bfxh.trit.core.WorldView;
+import com.bfxh.trit.neo.AiPointer;
 import com.bfxh.trit.sense.Sensor;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.fabricmc.api.ClientModInitializer;
@@ -17,6 +19,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.minecraft.client.CameraType;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -82,12 +85,24 @@ public class TritMod implements ClientModInitializer {
     private KeyMapping kView;
     private KeyMapping kAttack;
     private KeyMapping kMove;
+    /** 摄像头预算档位循环键（默认 F8）。 */
+    private KeyMapping kCam;
     // 环盘菜单导航键
     private KeyMapping kMenuPrev;
     private KeyMapping kMenuNext;
     private KeyMapping kMenuConfirm;
     private KeyMapping kMenuCancel;
     private KeyMapping[] kMenuDigit = new KeyMapping[6];
+
+    /** 摄像头预算：AI 自己选择调不调，但幅度与归还由这一层判。 */
+    private final CameraBudget camBudget = new CameraBudget();
+    /** AI 的独立指针：预算不够时「看」这件事发生在它身上，不碰真实镜头。 */
+    private final AiPointer pointer = new AiPointer();
+    /** 借用的机位还剩几拍（第三人称看清大概范围后自动归还）。 */
+    private int perspectiveBorrowLeft;
+    /** AI 请求设置过的机位；玩家自己按 F5 改了就立刻放弃借用。 */
+    private int aiSetCamMode = -1;
+    private static final int PERSPECTIVE_TICKS = 60;
 
     private long tick;
     private boolean moveEnabled = true;
@@ -115,6 +130,8 @@ public class TritMod implements ClientModInitializer {
                 new KeyMapping("key." + MOD_ID + ".attack", InputConstants.KEY_F6, cat));
         kMove = KeyMappingHelper.registerKeyMapping(
                 new KeyMapping("key." + MOD_ID + ".move", InputConstants.KEY_F7, cat));
+        kCam = KeyMappingHelper.registerKeyMapping(
+                new KeyMapping("key." + MOD_ID + ".camera", InputConstants.KEY_F8, cat));
 
         // 菜单导航键（与游戏默认移动键不冲突：方向键 / 数字键 / 回车 / 退格）
         kMenuPrev = KeyMappingHelper.registerKeyMapping(
@@ -131,6 +148,7 @@ public class TritMod implements ClientModInitializer {
         }
 
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
+        actuator.setCameraBudget(camBudget);
 
         // 环盘菜单：注册成 HUD 叠层（26.3 不再有 GuiGraphics，改用 HudElement 抽取模型）
         HudElementRegistry.addLast(Identifier.fromNamespaceAndPath(MOD_ID, "menu"), new TritHud(this));
@@ -141,7 +159,7 @@ public class TritMod implements ClientModInitializer {
             ScreenEvents.remove(screen).register((s) -> nativeScreenOpen = false);
         });
 
-        LOG.info("[TRIT] 已加载。按 Y 打开环盘菜单选择模式，F9 急停，F10 视角，F6 攻击，F7 移动");
+        LOG.info("[TRIT] 已加载。按 Y 打开环盘菜单选择模式，F9 急停，F10 视角，F6 攻击，F7 移动，F8 摄像头预算");
     }
 
     public static TritMod get() {
@@ -204,11 +222,16 @@ public class TritMod implements ClientModInitializer {
         // 1) 感知
         WorldView w = sensor.sense(mc, tick, true);
         lastView = w;
+        w.camBudgetLevel = camBudget.level().ordinal();
+        updatePointer(w);
 
         // 玩家自己操作时（按移动/攻击/使用/蹲下键，或正在破坏方块）→ 全部让权，绝不抢。
         // 注意：开原生界面（背包/聊天）不再整体让权——AI 决策照常跑，只锁住视角与动作，
         // 这样「你开背包它不会傻掉、关掉立刻恢复」，也不会在你读菜单时乱转视角。
         boolean yieldAll = w.humanActing;
+        // 机位借用（「一调三」看清大概范围）：到期归还、玩家手动改了立刻放弃，
+        // 这两件事即使在让权期间也要做，否则镜头会一直停在 AI 借的机位上。
+        handlePerspective(mc, w, !yieldAll);
         if (yieldAll) {
             actuator.detach(p); // 交还物理输入给玩家（幂等）
             return;
@@ -259,6 +282,12 @@ public class TritMod implements ClientModInitializer {
         // 5) 执行（nativeScreenOpen 时 locked=true：锁视角/动作，但不冻结 AI）
         actuator.apply(mc, d, w, moveEnabled, attackEnabled, nativeScreenOpen);
 
+        // 5b) 摄像头读数：本拍 AI 真写了多少度、偏离锚点多少、被预算夹掉多少
+        w.camAppliedYaw = camBudget.appliedYaw();
+        w.camAppliedPitch = camBudget.appliedPitch();
+        w.camDeviation = camBudget.deviationYaw();
+        w.camClippedTotal = (float) camBudget.clippedTotal();
+
         // 6) 状态显示（action bar，不刷聊天栏）
         if (tick % 5 == 0) {
             p.sendOverlayMessage(Component.literal(statusLine()).withColor(0xFFCC55));
@@ -285,6 +314,10 @@ public class TritMod implements ClientModInitializer {
         if (kMove.consumeClick()) {
             moveEnabled = !moveEnabled;
             notify(mc, (moveEnabled ? "§a[TRIT] 移动：开" : "§c[TRIT] 移动：关"));
+        }
+        if (kCam != null && kCam.consumeClick()) {
+            CameraBudget.Level lv = camBudget.cycle();
+            notify(mc, "§a[TRIT] 摄像头预算：" + lv.zh + "（±" + (int) lv.limit + "°）");
         }
     }
 
@@ -379,6 +412,153 @@ public class TritMod implements ClientModInitializer {
         return lastView != null ? lastView.followId : -1;
     }
 
+    // ------------------------------------------------------------------
+    // 独立指针 / 机位借用（摄像头所有权见 docs/需求与设计.md §3）
+
+    /**
+     * 维护 AI 的独立指针。
+     *
+     * <p>档位允许自由看（跟踪/自由）时，指针就贴着真实镜头 —— 不必多花一份算力；
+     * 档位收紧（关/微调）时，待命扫视改在这根指针上转，真实镜头一动不动。
+     */
+    private void updatePointer(WorldView w) {
+        if (w.yaw == null || w.pitch == null) {
+            w.pointerYaw = null;
+            w.pointerPitch = null;
+            w.pointerToCamera = null;
+            return;
+        }
+        if (camBudget.allowsFreeLook()) {
+            pointer.set(w.yaw, w.pitch);
+        } else {
+            float center = w.yaw;
+            float phase = (float) (0.5 + 0.5 * Math.cos(tick * 0.02));
+            pointer.scanAround(center, 150f, phase);
+            pointer.stepToward(9f);
+        }
+        w.pointerYaw = pointer.yaw();
+        w.pointerPitch = pointer.pitch();
+        float dy = wrap180(pointer.yaw() - w.yaw);
+        float dp = pointer.pitch() - w.pitch;
+        w.pointerToCamera = (float) Math.sqrt((double) dy * dy + (double) dp * dp);
+    }
+
+    /**
+     * 机位借用：AI 觉得「第一人称看不清大概范围」时，自己把镜头切到第三人称背后，
+     * {@value #PERSPECTIVE_TICKS} 拍后自动换回来。玩家自己按过 F5 就立刻放弃借用。
+     *
+     * @param canAcquire false = 玩家正在操作，只允许到期归还，不允许新借
+     */
+    private void handlePerspective(Minecraft mc, WorldView w, boolean canAcquire) {
+        LocalPlayer p = mc.player;
+        if (p == null || w.camMode == null) return;
+        int mode = w.camMode;
+
+        if (perspectiveBorrowLeft > 0) {
+            if (aiSetCamMode >= 0 && mode != aiSetCamMode) {
+                // 玩家手动改时机位所有权立刻作废
+                perspectiveBorrowLeft = 0;
+                aiSetCamMode = -1;
+                return;
+            }
+            if (--perspectiveBorrowLeft == 0) {
+                mc.options.setCameraType(CameraType.FIRST_PERSON);
+                aiSetCamMode = -1;
+            }
+            return;
+        }
+        if (!canAcquire || !camBudget.allowsPerspectiveSwitch()) return;
+        // 借机位的条件：A 级弹幕扎堆（≥2）且当前是第一人称 —— 单颗弹不需要看清范围
+        Integer aGrade = w.projectileAGrade;
+        if (aGrade == null || aGrade < 2) return;
+        if (mode != 0) return;
+        if (actuator.requestPerspective(mc, CameraType.THIRD_PERSON_BACK)) {
+            perspectiveBorrowLeft = PERSPECTIVE_TICKS;
+            aiSetCamMode = 1;
+        }
+    }
+
+    private static float wrap180(float a) {
+        while (a > 180f) a -= 360f;
+        while (a <= -180f) a += 360f;
+        return a;
+    }
+
+    // ---- HUD 读数 ----
+
+    /** 相机模式序号（0/1/2），null = 未知。 */
+    public Integer camModeHint() {
+        return lastView != null ? lastView.camMode : null;
+    }
+
+    /** 来袭方位（相对朝向的水平角差，度），null = 没有 A 级弹。 */
+    public Float incomingYawHint() {
+        return lastView != null ? lastView.yawToProj : null;
+    }
+
+    /** AI 是否处于接管状态（HUD 用它决定要不要画指标）。 */
+    public boolean isArmed() {
+        return machine.armed();
+    }
+
+    /**
+     * 视角归属一行读数：现在是第几视角 + 预算档位 + 本拍 AI 真写了多少度。
+     * 用户要的「有指标，知道是看第三还是第一」就是这一行。
+     */
+    public String cameraHint() {
+        WorldView w = lastView;
+        String mode = WorldView.camModeName(w == null ? null : w.camMode);
+        float wrote = w == null ? 0f : Math.max(w.camAppliedYaw, w.camAppliedPitch);
+        String owner = wrote < 0.05f ? "归你" : ("AI动" + String.format("%.1f°", wrote));
+        return "镜" + mode + " · 预算" + camBudget.level().zh + " · " + owner;
+    }
+
+    /** 弹幕一行读数，供 HUD 与调试用。 */
+    public String projectileHint() {
+        WorldView w = lastView;
+        if (w == null || w.projectileCount == null) return "弹:?";
+        if (w.projThreat == com.bfxh.trit.core.Tri.POS) {
+            return String.format("弹%d A%d %s tti%.0f cpa%.1f 带%.1f σ%.2f 躲%s",
+                    w.projectileCount, w.projectileAGrade == null ? 0 : w.projectileAGrade,
+                    w.projKind == null ? "?" : w.projKind,
+                    w.projTti == null ? -1 : w.projTti,
+                    w.projCpa == null ? -1 : w.projCpa,
+                    w.projBand == null ? 0 : w.projBand,
+                    w.projSigma == null ? 0 : w.projSigma,
+                    dodgeName(w.dodgeAction));
+        }
+        return "弹" + w.projectileCount + " 无A级";
+    }
+
+    /** 躲避动作名（与 ProjectilePredictor 的下标约定一致）。 */
+    private static final String[] DODGE_NAMES = {"左", "右", "后", "前", "跳"};
+
+    private static String dodgeName(int action) {
+        return (action >= 0 && action < DODGE_NAMES.length) ? DODGE_NAMES[action] : "无";
+    }
+
+    /**
+     * 已学的躲避先验一行读数：只有 A 级弹的那一类才有意义。
+     * 实机判据要看「挨打后同一类弹的某个方向转负」，就得能从日志里读出来。
+     */
+    private String priorHint() {
+        if (sensor == null || lastView == null || lastView.projKind == null) return "先验:无";
+        com.bfxh.trit.neo.Ballistics.Kind kind;
+        try {
+            kind = com.bfxh.trit.neo.Ballistics.Kind.valueOf(
+                    lastView.projKind.toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            return "先验:无";
+        }
+        float[] w = sensor.projectiles().dodgePriorOf(kind);
+        StringBuilder sb = new StringBuilder(48);
+        sb.append("先验 ").append(lastView.projKind).append(':');
+        for (int i = 0; i < w.length && i < DODGE_NAMES.length; i++) {
+            sb.append(DODGE_NAMES[i]).append(String.format("%+.2f ", w[i]));
+        }
+        return sb.toString();
+    }
+
     private static void notify(Minecraft mc, String msg) {
         LocalPlayer p = mc.player;
         if (p != null) {
@@ -401,8 +581,19 @@ public class TritMod implements ClientModInitializer {
     // ---- 调试用：把当前内部状态导出成一行，供日志或命令查看 ----
     public String debugLine() {
         if (lastView == null || lastDecision == null) return "no data";
+        WorldView w = lastView;
         return statusLine() + " | votes: " + lastVotes
                 + " | tick " + tick
-                + " | move=" + moveEnabled + " attack=" + attackEnabled + " view=" + viewEnabled;
+                + " | move=" + moveEnabled + " attack=" + attackEnabled + " view=" + viewEnabled
+                + " | cam mode=" + w.camMode + " budget=" + w.camBudgetLevel
+                + " wrote=" + String.format("%.1f/%.1f", w.camAppliedYaw, w.camAppliedPitch)
+                + " dev=" + String.format("%.1f", w.camDeviation)
+                + " clipped=" + String.format("%.0f", w.camClippedTotal)
+                + " | " + projectileHint()
+                + " | " + priorHint()
+                + " | ptr=" + String.format("%.0f/%.0f Δ%.0f",
+                w.pointerYaw == null ? 0 : w.pointerYaw,
+                w.pointerPitch == null ? 0 : w.pointerPitch,
+                w.pointerToCamera == null ? 0 : w.pointerToCamera);
     }
 }

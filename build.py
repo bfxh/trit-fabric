@@ -19,6 +19,14 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# 同 test.py：中文 Windows 控制台默认 cp936，javac 报错里有非 GBK 字节会把真错误吞成
+# UnicodeEncodeError。输出统一 UTF-8。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 MC_JAR = r"E:\MC\MC\meta\versions\26.3-0.20.1\26.3-0.20.1.jar"
 MC_LIBS = r"E:\MC\MC\meta\libraries"
 JAVAC = r"E:\MC\MC\meta\java_versions\mojang-java-runtime-epsilon-windows-x64-b374544c680d\bin\javac.exe"
@@ -58,6 +66,18 @@ def classpath() -> list[str]:
     return paths
 
 
+def decode(raw: bytes) -> str:
+    """javac 在中文 Windows 上按 GBK 输出，硬按 UTF-8 解会得到乱码，等于看不见真错误。"""
+    if not raw:
+        return ""
+    for enc in ("utf-8", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def compile_java(cp: list[str]) -> bool:
     src = os.path.join(ROOT, "src", "main", "java")
     sources = []
@@ -84,15 +104,14 @@ def compile_java(cp: list[str]) -> bool:
         for s in sources:
             f.write(s + "\n")
 
-    r = subprocess.run([JAVAC, "@" + argfile], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+    r = subprocess.run([JAVAC, "@" + argfile], capture_output=True)
     if r.returncode != 0:
         print("=== 编译失败 ===")
-        print(r.stdout[:8000])
-        print(r.stderr[:4000])
+        print(decode(r.stdout)[:8000])
+        print(decode(r.stderr)[:4000])
         return False
     if r.stdout.strip():
-        print(r.stdout[:2000])
+        print(decode(r.stdout)[:2000])
     print(f"编译通过：{len(sources)} 个源文件")
     return True
 
