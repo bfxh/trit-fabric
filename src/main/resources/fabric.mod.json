@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "trit",
+  "version": "0.1.0+26.3",
+  "name": "TriT Agent",
+  "description": "三值（Kleene K3）状态机 AI：投票 / 裁决 / 迟滞，信息不足时弃权而不是猜。",
+  "authors": ["bfxh"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.bfxh.trit.TritMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "fabric-api": "*",
+    "minecraft": "*"
+  }
+}

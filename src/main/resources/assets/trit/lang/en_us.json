@@ -1,0 +1,8 @@
+{
+  "key.categories.trit.main": "TriT Agent",
+  "key.trit.toggle": "Toggle AI takeover",
+  "key.trit.halt": "Emergency stop",
+  "key.trit.view": "Toggle view control",
+  "key.trit.attack": "Toggle attack",
+  "key.trit.move": "Toggle movement"
+}

@@ -1,0 +1,8 @@
+{
+  "key.categories.trit.main": "TriT 状态机",
+  "key.trit.toggle": "接管 / 交还 AI",
+  "key.trit.halt": "急停（全部松手）",
+  "key.trit.view": "视角控制开关",
+  "key.trit.attack": "攻击开关",
+  "key.trit.move": "移动开关"
+}
