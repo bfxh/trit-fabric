@@ -22,6 +22,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.Entity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -65,9 +66,9 @@ public class TritMod implements ClientModInitializer {
     /** 环盘菜单选出的主动模式（默认交还控制权）。 */
     private Mode mode = Mode.OFF;
 
-    /** 环盘菜单的选项，顺序即方位。 */
+    /** 环盘菜单的选项，顺序即方位：index 0 在正上方（全停）。 */
     private static final Mode[] MENU_OPTIONS = {
-            Mode.PATROL, Mode.FORAGE, Mode.COMBAT, Mode.BUILD, Mode.FOLLOW, Mode.OFF
+            Mode.OFF, Mode.PATROL, Mode.FORAGE, Mode.COMBAT, Mode.BUILD, Mode.FOLLOW
     };
     /** 环盘菜单是否打开（HUD 叠层，不暂停游戏）。 */
     private boolean menuOpen;
@@ -204,8 +205,10 @@ public class TritMod implements ClientModInitializer {
         WorldView w = sensor.sense(mc, tick, true);
         lastView = w;
 
-        // 玩家自己操作时（按移动/攻击/使用键，或正在破坏方块，或开了原生界面）→ 全部让权
-        boolean yieldAll = w.humanActing || nativeScreenOpen;
+        // 玩家自己操作时（按移动/攻击/使用/蹲下键，或正在破坏方块）→ 全部让权，绝不抢。
+        // 注意：开原生界面（背包/聊天）不再整体让权——AI 决策照常跑，只锁住视角与动作，
+        // 这样「你开背包它不会傻掉、关掉立刻恢复」，也不会在你读菜单时乱转视角。
+        boolean yieldAll = w.humanActing;
         if (yieldAll) {
             actuator.detach(p); // 交还物理输入给玩家（幂等）
             return;
@@ -253,8 +256,8 @@ public class TritMod implements ClientModInitializer {
         Decision d = machine.step(w, votes, enabled);
         lastDecision = d;
 
-        // 5) 执行
-        actuator.apply(mc, d, w, moveEnabled, attackEnabled);
+        // 5) 执行（nativeScreenOpen 时 locked=true：锁视角/动作，但不冻结 AI）
+        actuator.apply(mc, d, w, moveEnabled, attackEnabled, nativeScreenOpen);
 
         // 6) 状态显示（action bar，不刷聊天栏）
         if (tick % 5 == 0) {
@@ -336,20 +339,44 @@ public class TritMod implements ClientModInitializer {
             mode = Mode.OFF;
             if (p != null) actuator.detach(p);
             notify(mc, "§c[TRIT] 已交还控制权");
-        } else {
-            machine.setArmed(true);
-            mode = m;
-            if (sensor != null) sensor.reset();
-            if (p != null) {
-                anchor.setAnchor(new double[]{p.getX(), p.getY(), p.getZ()});
-                actuator.attach(p);
-            }
-            notify(mc, "§a[TRIT] 模式：" + m.zh() + " —— 按 Y 再打开环盘菜单切换");
+            return;
         }
+        machine.setArmed(true);
+        mode = m;
+        if (sensor == null) sensor = new Sensor();
+        sensor.reset();
+        // 跟随：优先跟「准星所指的实体」，否则跟最近的玩家
+        if (m == Mode.FOLLOW) {
+            Entity e = mc.crosshairPickEntity;
+            if (e != null && e.isAlive() && (p == null || e != p)) {
+                sensor.setForcedFollow(e.getId());
+                notify(mc, "§a[TRIT] 跟随：" + e.getName().getString() + "（准星所指）");
+            } else {
+                sensor.setForcedFollow(null);
+                notify(mc, "§a[TRIT] 跟随：最近的玩家");
+            }
+        } else {
+            sensor.setForcedFollow(null);
+        }
+        if (p != null) {
+            anchor.setAnchor(new double[]{p.getX(), p.getY(), p.getZ()});
+            actuator.attach(p);
+        }
+        notify(mc, "§a[TRIT] 模式：" + m.zh() + " —— 按 Y 再打开环盘菜单切换");
     }
 
     public Mode currentMode() {
         return mode;
+    }
+
+    /** 当前跟随目标相对朝向的水平角差（度，正 = 在右边），无目标返回 null。供 HUD 画指向箭头。 */
+    public Float followYawHint() {
+        return lastView != null ? lastView.followYaw : null;
+    }
+
+    /** 当前跟随目标 id，-1 = 无。 */
+    public int followIdHint() {
+        return lastView != null ? lastView.followId : -1;
     }
 
     private static void notify(Minecraft mc, String msg) {

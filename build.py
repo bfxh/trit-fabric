@@ -127,11 +127,18 @@ def install(jar_path: str, fabric_api: str) -> None:
     if not os.path.isdir(MODS_DIR):
         print(f"目标 mods 目录不存在：{MODS_DIR}")
         return
-    # 清掉旧版本，避免两个 trit jar 同时被加载
+    # 清掉旧版本，避免两个 trit jar 同时被加载。
+    # 注意：直接 overwrite 即可（文件名固定为 trit-0.1.0.jar），不用 os.remove --
+    # 本机回收站删除会被拦截导致整条安装失败。旧 jar 移到 _old 备份而不是删。
+    old_dir = os.path.join(MODS_DIR, "_old")
     for f in os.listdir(MODS_DIR):
         if f.startswith("trit-") and f.endswith(".jar"):
-            os.remove(os.path.join(MODS_DIR, f))
-            print(f"删除旧版 {f}")
+            try:
+                os.makedirs(old_dir, exist_ok=True)
+                shutil.move(os.path.join(MODS_DIR, f), os.path.join(old_dir, f))
+                print(f"备份旧版 {f} → _old/")
+            except OSError as e:
+                print(f"无法移走旧版 {f}（忽略）：{e}")
 
     dst = os.path.join(MODS_DIR, os.path.basename(jar_path))
     shutil.copy2(jar_path, dst)

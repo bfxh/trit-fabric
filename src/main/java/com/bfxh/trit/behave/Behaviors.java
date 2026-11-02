@@ -108,39 +108,40 @@ public final class Behaviors {
             if (c.w.targetId < 0 || c.w.dist == null) return;
 
             float d = c.w.dist;
+            float yawT = c.w.yawToTarget == null ? 999f : c.w.yawToTarget;
+            float pitchT = c.w.pitchToTarget == null ? 999f : c.w.pitchToTarget;
 
-            // 瞄准：有精确角度就不猜，直接给方向
+            // 瞄准：有精确角度就不猜，直接给方向（预测过的提前量已经含在角度里）
             Tri yaw = turnDir(c.w.yawToTarget, 5f);
-            if (yaw != Tri.ZERO) out.add(Vote.of(Channel.YAW, yaw, 4, "combat_track"));
+            if (yaw != Tri.ZERO) out.add(Vote.of(Channel.YAW, yaw, 5, "combat_track"));
             Tri pitch = turnDir(c.w.pitchToTarget, 5f);
-            if (pitch != Tri.ZERO) out.add(Vote.of(Channel.PITCH, pitch, 2, "combat_aim"));
+            if (pitch != Tri.ZERO) out.add(Vote.of(Channel.PITCH, pitch, 3, "combat_aim"));
 
-            // 距离控制
+            boolean aligned = Math.abs(yawT) < 45f && Math.abs(pitchT) < 45f;
+
+            // 距离控制：贴脸就退一点，远了就压上
             if (d > 3.0f) {
                 out.add(Vote.of(Channel.FORWARD, Tri.POS, 4, "combat_close"));
-            } else if (d < 1.6f) {
+            } else if (d < 1.4f) {
                 out.add(Vote.of(Channel.FORWARD, Tri.NEG, 2, "combat_spacing"));
             } else {
                 out.add(Vote.abstain(Channel.FORWARD, 2, "combat_hold_range"));
             }
 
-            // 绕圈：不站桩挨打
+            // 侧移绕圈，不站桩挨打
             out.add(Vote.of(Channel.STRAFE, flip(c.tick), 2, "combat_strafe"));
 
-            // 够得着就打（近战）
-            if (d <= 3.2f && Math.abs(c.w.yawToTarget == null ? 999f : c.w.yawToTarget) < 45f) {
-                out.add(Vote.of(Channel.ATTACK, Tri.POS, 3, "combat"));
+            // 近战：够得着又瞄上了就打
+            if (d <= 3.2f && aligned) {
+                out.add(Vote.of(Channel.ATTACK, Tri.POS, 4, "combat"));
             }
 
-            // 远程：有弓有箭、距离拉开、视线通畅 → 拉弓（与近战互斥，交给裁决）
+            // 远程：有弓/弩+箭、距离拉开、视线通畅 → 拉弓放风筝（走位中射击，不傻蹲）
             if (c.w.hasBow == Boolean.TRUE && c.w.hasAmmo == Boolean.TRUE
                     && d > 5f && c.w.targetOccluded != Boolean.TRUE) {
-                out.add(Vote.of(Channel.RANGED, Tri.POS, 4, "combat_ranged"));
-                // 蹲下稳准，别边跑边射
-                out.add(Vote.of(Channel.CROUCH, Tri.POS, 2, "combat_steady"));
-                // 拉弓期间站住，走动会打断蓄力
-                out.add(Vote.abstain(Channel.FORWARD, 3, "combat_aim_still"));
-                out.add(Vote.abstain(Channel.STRAFE, 3, "combat_aim_still"));
+                out.add(Vote.of(Channel.RANGED, Tri.POS, 5, "combat_ranged"));
+                // 边打边往后拉一点距离，比原地蹲着更活
+                out.add(Vote.of(Channel.FORWARD, Tri.NEG, 2, "combat_kite"));
             }
 
             // 打不过就跳一跳（暴击 + 打乱对方预判）
@@ -210,6 +211,8 @@ public final class Behaviors {
             // 只在「采集模式」主动找树/矿；其它模式不抢着挖，避免和你抢控制权
             if (c.mode != Mode.FORAGE) return;
             if (c.phase != Phase.IDLE) return;
+            // 有活威胁就别挖了，交给战斗/撤退（这是「打仗时还挖木头」的根因）
+            if (c.w.threat == Tri.POS) return;
             // 血量太低先别干活
             if (c.w.hp != null && c.w.hp < 0.35f) return;
             int[] res = c.w.resourcePos;
@@ -314,8 +317,13 @@ public final class Behaviors {
             if (c.phase != Phase.IDLE) return;
             if (c.w.resourcePos != null) return;
             if (c.w.targetId >= 0) return;
-            // 每 2 秒换个方向扫
-            out.add(Vote.of(Channel.YAW, flip(c.tick), 3, "idle_scan"));
+            // 平滑扫视：正弦来回，约 6 秒一圈，自然回到正前方，不会卡在某个死角。
+            double v = Math.cos(c.tick * 0.025);
+            out.add(Vote.of(Channel.YAW, v >= 0 ? Tri.POS : Tri.NEG, 3, "idle_scan"));
+            // 把俯仰慢慢拉平，别一直盯着地面或天空（这是「视角往地下看」的残留根因）
+            if (c.w.pitch != null && Math.abs(c.w.pitch) > 3f) {
+                out.add(Vote.of(Channel.PITCH, c.w.pitch > 0 ? Tri.NEG : Tri.POS, 2, "idle_level"));
+            }
         }
     }
 
@@ -331,13 +339,14 @@ public final class Behaviors {
 
         @Override
         public void vote(Behavior.Ctx c, List<Vote> out) {
-            // 有威胁、又不是贴脸近战：蹲下藏一点（站桩挨打不如蹲着缩）
-            if (c.w.threat == Tri.POS && c.phase != Phase.ENGAGE) {
-                out.add(Vote.of(Channel.CROUCH, Tri.POS, 2, "stealth_threat"));
-            }
-            // 悬崖边且没在战斗：蹲下别往后退掉坑里
+            // 只在「悬崖边别往后退掉坑里」时蹲下——这是保命，不是默认动作。
             if (c.w.pit == Boolean.TRUE && c.phase != Phase.ENGAGE && c.phase != Phase.RETREAT) {
                 out.add(Vote.of(Channel.CROUCH, Tri.POS, 3, "stealth_edge"));
+            }
+            // 有威胁但根本看不到目标（纯未知）、且不在交战：缩一下藏身，别傻站着硬刚。
+            // 注意：一旦进入 ENGAGE 由战斗逻辑接管，这里不再掺和，避免「只会蹲不会跑」。
+            if (c.w.threat == Tri.POS && c.phase == Phase.IDLE && c.w.targetId < 0) {
+                out.add(Vote.of(Channel.CROUCH, Tri.POS, 1, "stealth_hide"));
             }
         }
     }
@@ -405,6 +414,79 @@ public final class Behaviors {
         }
     }
 
+    /** 水平面距离（忽略 y）。 */
+    private static double distXZ(double[] a, double[] b) {
+        if (a == null || b == null) return Double.MAX_VALUE;
+        double dx = a[0] - b[0], dz = a[2] - b[2];
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    // ==================================================================
+    // 开路：卡住且正前方是可挖方块（土/草/沙/石头等，不含危险与原木/矿）→ 挖开。
+    // 解决「只会挖木头、不会挖土/各种方块开路」以及被墙卡死的问题。
+    // 与采集互不抢：采集在挖它自己的目标时这里让位。
+    // ==================================================================
+    public static final class BlockedDig implements Behavior {
+        @Override
+        public String name() {
+            return "blocked_dig";
+        }
+
+        @Override
+        public void vote(Behavior.Ctx c, List<Vote> out) {
+            if (c.w.canDigFront != Boolean.TRUE) return;
+            if (!c.w.stuck) return;
+            if (c.phase == Phase.ENGAGE || c.phase == Phase.RETREAT) return;
+            if (c.w.resourcePos != null && c.w.resourceDist != null && c.w.resourceDist < 4f) return;
+            Tri yaw = turnDir(c.w.yawToFront, 8f);
+            if (yaw != Tri.ZERO) out.add(Vote.of(Channel.YAW, yaw, 4, "blocked_dig_turn"));
+            Tri pitch = turnDir(c.w.pitchToFront, 6f);
+            if (pitch != Tri.ZERO) out.add(Vote.of(Channel.PITCH, pitch, 3, "blocked_dig_aim"));
+            if (yaw == Tri.ZERO && pitch == Tri.ZERO) {
+                out.add(Vote.hold(Channel.ATTACK, 4, "blocked_dig"));
+                out.add(Vote.abstain(Channel.FORWARD, 3, "blocked_dig_hold"));
+            }
+        }
+    }
+
+    // ==================================================================
+    // 跟随：FOLLOW 模式下跟踪某个实体（环盘菜单里用准星指定的，或默认最近玩家）。
+    // 保持约 4 格距离，看着它走，遇墙绕开。自保（交战/撤退）时让位。
+    // ==================================================================
+    public static final class Follow implements Behavior {
+        @Override
+        public String name() {
+            return "follow";
+        }
+
+        @Override
+        public void vote(Behavior.Ctx c, List<Vote> out) {
+            if (c.mode != Mode.FOLLOW) return;
+            if (c.w.followId < 0 || c.w.followXyz == null) return;
+            if (c.phase == Phase.ENGAGE || c.phase == Phase.RETREAT) return;
+
+            Tri yaw = turnDir(c.w.followYaw, 6f);
+            if (yaw != Tri.ZERO) out.add(Vote.of(Channel.YAW, yaw, 5, "follow_track"));
+            Tri pitch = turnDir(c.w.followPitch, 6f);
+            if (pitch != Tri.ZERO) out.add(Vote.of(Channel.PITCH, pitch, 3, "follow_aim"));
+
+            double d = distXZ(c.w.pos, c.w.followXyz);
+            if (d > 5.0) {
+                out.add(Vote.of(Channel.FORWARD, Tri.POS, 4, "follow_close"));
+            } else if (d < 2.5) {
+                out.add(Vote.of(Channel.FORWARD, Tri.NEG, 3, "follow_back"));
+            } else {
+                out.add(Vote.abstain(Channel.FORWARD, 2, "follow_hold"));
+            }
+
+            if (c.w.wallAt(0)) {
+                out.add(Vote.abstain(Channel.FORWARD, 4, "follow_wall"));
+                out.add(Vote.of(Channel.YAW, flip(c.tick), 4, "follow_turn"));
+                if (c.w.step == Boolean.TRUE) out.add(Vote.of(Channel.JUMP, Tri.POS, 2, "follow_hop"));
+            }
+        }
+    }
+
     /** 组装默认行为链。顺序不影响结果：裁决只看权重和方向。 */
     public static Behavior[] defaults(Anchor anchor) {
         return new Behavior[]{
@@ -415,9 +497,11 @@ public final class Behaviors {
                 new Regen(),
                 new Forage(),
                 new Build(),
+                new BlockedDig(),
                 new Stealth(),
                 new Patrol(),
                 new IdleScan(),
+                new Follow(),
                 anchor,
         };
     }

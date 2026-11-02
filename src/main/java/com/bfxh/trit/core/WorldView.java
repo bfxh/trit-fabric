@@ -86,6 +86,15 @@ public final class WorldView {
     public int[] frontPos;
     /** 准星命中面的方向序号（0..5），对应 Direction.values()。null = 无。 */
     public Integer frontFace;
+    /** 准星所指方块相对朝向的水平角差（度，正 = 在右边）。null = 无。 */
+    public Float yawToFront;
+    /** 准星所指方块相对视线的俯仰角差（度，正 = 在下方）。null = 无。 */
+    public Float pitchToFront;
+    /**
+     * 准星所指方块是否可挖（非空气、非危险、非液体、非原木/矿石）。
+     * 用于「卡住时挖开前面的土/石头开路」，与采集（logs/ores）互不抢。
+     */
+    public Boolean canDigFront;
 
     // ---- 交互 / 装备 / 地形（灵性操作需要的信号）----
 
@@ -112,6 +121,17 @@ public final class WorldView {
     public Boolean inLiquid;
     /** 正前方一格是坑或液体（需要搭桥）。null = 未判定。 */
     public Boolean gapAhead;
+
+    // ---- 跟随目标（FOLLOW 模式用）----
+
+    /** 当前跟随的实体 id，-1 = 无。 */
+    public int followId = -1;
+    /** 跟随目标坐标。null = 无。 */
+    public double[] followXyz;
+    /** 跟随目标相对当前朝向的水平角差（度，正 = 在右边）。null = 无。 */
+    public Float followYaw;
+    /** 跟随目标相对当前视线的俯仰角差（度，正 = 在下方）。null = 无。 */
+    public Float followPitch;
 
     public long tick;
 
@@ -160,6 +180,9 @@ public final class WorldView {
         c.resourceDist = resourceDist;
         c.frontPos = frontPos == null ? null : frontPos.clone();
         c.frontFace = frontFace;
+        c.yawToFront = yawToFront;
+        c.pitchToFront = pitchToFront;
+        c.canDigFront = canDigFront;
         c.humanActing = humanActing;
         c.resourceOccluded = resourceOccluded;
         c.targetOccluded = targetOccluded;
@@ -170,6 +193,10 @@ public final class WorldView {
         c.onGround = onGround;
         c.inLiquid = inLiquid;
         c.gapAhead = gapAhead;
+        c.followId = followId;
+        c.followXyz = followXyz == null ? null : followXyz.clone();
+        c.followYaw = followYaw;
+        c.followPitch = followPitch;
         c.tick = tick;
         return c;
     }

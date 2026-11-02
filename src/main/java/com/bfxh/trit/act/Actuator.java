@@ -35,8 +35,13 @@ import java.util.function.Predicate;
  *   <li>移动 —— 写 {@link AiInput}，替换 {@code player.input}。</li>
  *   <li>视角 —— 直接改 {@code yRot / xRot}。速率而不是瞬时对齐，
  *       这样「三值通道」的语义（左转 / 不动 / 右转）才能保留。</li>
- *   <li>左右键 —— 走 {@code gameMode}，等价于玩家真实点击，服务端认可。</li>
+ *   <li>左右键 / 使用 —— 走 {@code gameMode}，等价于玩家真实点击，服务端认可。</li>
  * </ol>
+ *
+ * <p>弓/弩蓄力：必须「持续按住」使用键才能让游戏真正蓄力并击发。26.3 里使用键的
+ * 持续状态来自 {@code options.keyUse}，所以这里用 {@code keyUse.setDown(true)} 按住、
+ * 松开即击发——之前只调一次 {@code useItem} 会被游戏每拍 {@code releaseUsingItem} 解掉，
+ * 表现就是「拉不了弓」。</p>
  */
 public final class Actuator {
 
@@ -56,9 +61,7 @@ public final class Actuator {
     private int attackCooldown;
     /** 上一次挖掘的目标，用来判断是不是换了个方块。 */
     private int[] miningPos;
-    /** 是否由我们发起了「按住右键」（进食）。交还控制权前必须松开。 */
-    private boolean holdingUse;
-    /** 弓蓄力状态机：bowing = 正在拉弓，bowCharge = 已蓄的拍数。 */
+    /** 弓蓄力状态机：bowing = 正在按住使用键蓄力，bowCharge = 已蓄的拍数。 */
     private boolean bowing;
     private int bowCharge;
     /** 弓拉满需要的拍数（约 1.1 秒）。 */
@@ -84,22 +87,25 @@ public final class Actuator {
      */
     public void detach(LocalPlayer p) {
         input.release();
+        releaseUseKey(Minecraft.getInstance());
         if (attached && p != null && saved != null) {
             p.input = saved;
         }
         attached = false;
         saved = null;
         stopMining(null);
-        holdingUse = false;
         attackCooldown = 0;
+        bowing = false;
+        bowCharge = 0;
     }
 
     /**
      * 应用一拍裁决。
      *
-     * @param cfg 视角开关等参数
+     * @param locked 玩家开了原生界面（背包/聊天等）：锁住视角与一切动作，
+     *               只保留 AI 的决策循环（在 TritMod 里跑），不冻结它的大脑。
      */
-    public void apply(Minecraft mc, Decision d, WorldView w, boolean moveEnabled, boolean attackEnabled) {
+    public void apply(Minecraft mc, Decision d, WorldView w, boolean moveEnabled, boolean attackEnabled, boolean locked) {
         LocalPlayer p = mc.player;
         if (p == null) return;
 
@@ -109,10 +115,21 @@ public final class Actuator {
             p.input = input;
         }
 
+        if (locked) {
+            // 你在开背包/聊天：别动你的视角，也别偷偷按键。AI 决策照常跑，关掉界面立刻恢复。
+            input.release();
+            releaseUseKey(mc);
+            bowing = false;
+            bowCharge = 0;
+            return;
+        }
+
         if (d.phase == Phase.OFF) {
             input.release();
             stopMining(mc);
-            releaseUse(mc, p);
+            releaseUseKey(mc);
+            bowing = false;
+            bowCharge = 0;
             return;
         }
 
@@ -143,8 +160,7 @@ public final class Actuator {
             input.release();
         }
 
-        // 视角：固定速率会在接近目标时过冲，然后来回摆。
-        // 有精确角度差时按差值的比例收速，接近了就慢下来。
+        // 视角：有精确角度差时按差值的比例收速，接近了就慢下来，避免过冲来回摆。
         Float guide = null;
         if (d.phase == Phase.ENGAGE && w.targetId >= 0) guide = w.yawToTarget;
         else if (d.attackHold) guide = w.yawToResource;
@@ -159,6 +175,11 @@ public final class Actuator {
             float np = p.getXRot() + pitchCh.toInt() * step;
             p.setXRot(Math.max(-89f, Math.min(89f, np)));
         }
+        // 待命/扫视时把俯仰慢慢拉平，别一直盯着地面或天空（「视角往地下看」的残留根因）
+        if (guide == null && !d.attackHold && Math.abs(p.getXRot()) > 0.5f) {
+            float step = Math.min(PITCH_RATE, Math.max(1f, Math.abs(p.getXRot()) * 0.25f));
+            p.setXRot(p.getXRot() - Math.signum(p.getXRot()) * step);
+        }
 
         if (d.phase == Phase.RECOVER) {
             input.release();
@@ -166,24 +187,25 @@ public final class Actuator {
                 p.respawn();
             }
             stopMining(mc);
-            releaseUse(mc, p);
+            releaseUseKey(mc);
+            bowing = false;
+            bowCharge = 0;
             return;
         }
 
-        // 右键 / 食用。只对食物下嘴 —— 主手拿着方块时 useItem 会把方块放下去。
-        if (use == Tri.POS) {
-            if (!p.isUsingItem() && ensureFoodInHand(p)) {
-                mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
-                holdingUse = true;
-            }
-        } else {
-            releaseUse(mc, p);
-        }
+        // 进食：主手拿食物 + 按住使用键，游戏会自己持续吃。
+        boolean eating = (use == Tri.POS) && ensureFoodInHand(p);
 
-        // 远程：拉弓射击（与近战互斥，由行为层按距离 / 视线决定走哪条）
+        // 远程：拉弓/弩蓄力（管理 bowing，真正的按键由下面的 keyUse 统一按住/松开）。
         handleRanged(mc, p, w, ranged, attackEnabled);
 
-        // 左键：持续采矿 或 近战脉冲
+        // 使用键：进食或拉弓时按住，其余时刻松开。
+        releaseUseKey(mc);
+        if (eating || bowing) {
+            mc.options.keyUse.setDown(true);
+        }
+
+        // 左键：持续采矿/开路 或 近战脉冲
         if (attackEnabled && attack != Tri.ZERO) {
             if (d.attackHold) {
                 mine(mc, w);
@@ -216,25 +238,24 @@ public final class Actuator {
         if (w.dist > MELEE_RANGE) return;
         Entity e = level.getEntity(w.targetId);
         if (e == null || e.isRemoved()) return;
-        // gameMode.attack 内部已经处理挥手动画，26.3 的 swing 需要额外参数，不再单独调
         mc.gameMode.attack(p, e);
-        // 近战冷却大约 0.5 秒，留 10 拍
         attackCooldown = 10;
     }
 
-    /** 持续挖掘（砍树 / 挖矿）。 */
+    /** 持续挖掘（砍树 / 挖矿 / 卡住开路：优先挖采集目标，没有就挖准星所指的方块）。 */
     private void mine(Minecraft mc, WorldView w) {
         LocalPlayer p = mc.player;
         MultiPlayerGameMode gm = mc.gameMode;
         if (p == null || gm == null) return;
 
-        int[] target = w.resourcePos;
+        int[] target = w.resourcePos != null ? w.resourcePos : w.frontPos;
         if (target == null) {
             stopMining(mc);
             return;
         }
         // 瞄准到位了才下镐，否则先把视角转过去
-        if (w.yawToResource != null && Math.abs(w.yawToResource) > AIM_TOLERANCE) {
+        Float aimYaw = (w.resourcePos != null) ? w.yawToResource : w.yawToFront;
+        if (aimYaw != null && Math.abs(aimYaw) > AIM_TOLERANCE) {
             stopMining(mc);
             return;
         }
@@ -257,13 +278,16 @@ public final class Actuator {
     // 远程 / 放置 / 武器选择
     // ------------------------------------------------------------------
 
-    /** 拉弓 → 蓄满 → 松手射出。中间任何一拍断了（目标没了 / 关了攻击）就取消。 */
+    /**
+     * 拉弓/弩蓄力状态机。中间断掉（目标没了 / 关了攻击）→ 取消。
+     * 真正「按住使用键」由 {@link #apply} 里统一的 {@code keyUse.setDown} 完成：
+     * bowing 为真时按住，满拍数后 bowing 置否 → 松开 → 击发。
+     */
     private void handleRanged(Minecraft mc, LocalPlayer p, WorldView w, Tri ranged, boolean attackEnabled) {
         boolean want = ranged == Tri.POS && attackEnabled
                 && w.hasBow == Boolean.TRUE && w.hasAmmo == Boolean.TRUE;
         if (!want) {
             if (bowing) {
-                mc.gameMode.releaseUsingItem(p);
                 bowing = false;
                 bowCharge = 0;
             }
@@ -273,12 +297,11 @@ public final class Actuator {
             ensureRanged(p);
             bowing = true;
             bowCharge = 0;
-            mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
         }
         if (bowCharge < BOW_TICKS) {
             bowCharge++;
         } else {
-            mc.gameMode.releaseUsingItem(p);
+            // 蓄满：下一拍 keyUse 会松开 → 击发，然后重新蓄（循环射击）
             bowing = false;
             bowCharge = 0;
         }
@@ -302,7 +325,7 @@ public final class Actuator {
         mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, hit);
     }
 
-    /** 战斗近战前确保主手是剑 / 斧，最大化 dps。 */
+    /** 战斗近战前确保主手是剑 / 斧 / 趁手的工具，最大化 dps。 */
     private static void ensureMelee(LocalPlayer p) {
         ItemStack cur = p.getInventory().getItem(p.getInventory().getSelectedSlot());
         if (isMeleeWeapon(cur)) return;
@@ -324,9 +347,11 @@ public final class Actuator {
         return -1;
     }
 
-    /** 26.3 没有 SwordItem / AxeItem 子类了，用物品标签判定近战武器。 */
+    /** 26.3 没有 SwordItem / AxeItem / PickaxeItem 之类子类了，统一用物品标签判定近战武器。 */
     private static boolean isMeleeWeapon(ItemStack s) {
-        return !s.isEmpty() && s.is(h -> h.is(ItemTags.SWORDS) || h.is(ItemTags.AXES));
+        if (s.isEmpty()) return false;
+        return s.is(h -> h.is(ItemTags.SWORDS) || h.is(ItemTags.AXES)
+                || h.is(ItemTags.PICKAXES) || h.is(ItemTags.SHOVELS) || h.is(ItemTags.HOES));
     }
 
     private void stopMining(Minecraft mc) {
@@ -336,19 +361,9 @@ public final class Actuator {
         }
     }
 
-    /**
-     * 松开右键。
-     *
-     * <p>不松的话玩家会一直卡在「使用物品」状态：进食进度条停在那儿，
-     * 交还控制权后玩家自己按左右键也会失效。
-     */
-    private void releaseUse(Minecraft mc, LocalPlayer p) {
-        if (holdingUse) {
-            holdingUse = false;
-            if (mc != null && mc.gameMode != null && p != null) {
-                mc.gameMode.releaseUsingItem(p);
-            }
-        }
+    /** 松开使用键（弓/弩/进食共用）。 */
+    private static void releaseUseKey(Minecraft mc) {
+        if (mc != null) mc.options.keyUse.setDown(false);
     }
 
     /** 主手是食物吗？ */
@@ -359,8 +374,7 @@ public final class Actuator {
 
     /**
      * 确保主手拿着食物：主手不是就在快捷栏里找一个换过去。
-     *
-     * <p>只动「选中槽」，不动物品本身，玩家交还后槽位停在哪就停在哪，不丢东西。
+     * 只动「选中槽」，不动物品本身，玩家交还后槽位停在哪就停在哪，不丢东西。
      */
     private static boolean ensureFoodInHand(LocalPlayer p) {
         if (isEdible(p.getMainHandItem())) return true;

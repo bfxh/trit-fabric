@@ -5,11 +5,13 @@ import com.bfxh.trit.core.Tri;
 import com.bfxh.trit.core.WorldView;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.item.ArrowItem;
 import net.minecraft.world.item.BlockItem;
@@ -25,7 +27,9 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Field;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
 
@@ -38,9 +42,9 @@ import java.util.function.Predicate;
  */
 public final class Sensor {
 
-    /** 敌对生物扫描半径（格）。 */
+    /** 敌对生物扫描半径默认值（格）；实际每拍按渲染距离缩放。 */
     public static final float ENEMY_RADIUS = 24f;
-    /** 资源扫描半径（格）。 */
+    /** 资源扫描半径默认值（格）；实际每拍按渲染距离缩放。 */
     public static final float RESOURCE_RADIUS = 14f;
     /** 危险方块扫描半径（格）。 */
     private static final int HAZARD_RADIUS = 2;
@@ -54,6 +58,19 @@ public final class Sensor {
     private static final Set<Block> LOGS = new HashSet<>();
     private static final Set<Block> ORES = new HashSet<>();
     private static final Set<Block> HAZARDS = new HashSet<>();
+    /** 可挖开的「软/普通」方块（卡住时开路用）：土、草、沙、砂砾、雪、叶子、粘土、泥等。 */
+    private static final Set<Block> SOFT = new HashSet<>();
+
+    /** 当前实际扫描半径（按渲染距离缩放）。 */
+    private float enemyRadius = ENEMY_RADIUS;
+    private float resourceRadius = RESOURCE_RADIUS;
+
+    /** 跟随目标：玩家在环盘菜单里用准星指定的实体 id；null = 还没指定，用默认（最近玩家）。 */
+    private Integer forcedFollowId;
+
+    /** 目标上一拍坐标，用于预测其速度并提前量瞄准（打移动目标）。 */
+    private final Map<Integer, double[]> lastTargetPos = new HashMap<>();
+    private final Map<Integer, Long> lastTargetTick = new HashMap<>();
 
     /**
      * 分类表要<strong>懒构建</strong>。
@@ -85,6 +102,15 @@ public final class Sensor {
                     || n.equals("MAGMA_BLOCK") || n.equals("CACTUS") || n.equals("WITHER_ROSE")
                     || n.equals("SWEET_BERRY_BUSH") || n.equals("CAMPFIRE") || n.equals("SOUL_CAMPFIRE")) {
                 HAZARDS.add(b);
+            } else if (n.endsWith("_LEAVES") || n.endsWith("_DIRT") || n.equals("GRASS_BLOCK")
+                    || n.equals("DIRT") || n.equals("COARSE_DIRT") || n.equals("ROOTED_DIRT")
+                    || n.equals("SAND") || n.equals("RED_SAND") || n.equals("GRAVEL") || n.equals("SNOW")
+                    || n.equals("SNOW_BLOCK") || n.equals("CLAY") || n.equals("SOUL_SAND")
+                    || n.equals("SOUL_SOIL") || n.equals("MOSS_BLOCK") || n.equals("MUD")
+                    || n.equals("PODZOL") || n.equals("MYCELIUM") || n.equals("FARMLAND")
+                    || n.equals("DIRT_PATH") || n.equals("RED_SAND") || n.equals("SCAFFOLDING")
+                    || n.equals("HAY_BLOCK") || n.equals("SPONGE") || n.equals("WET_SPONGE")) {
+                SOFT.add(b);
             }
         }
     }
@@ -112,7 +138,17 @@ public final class Sensor {
     private Integer enemyCount;
     private int targetId = -1;
     private double[] targetXyz;
+    /** 战斗目标的速度（格/拍），用于提前量瞄准（预测）。 */
+    private double[] targetVel;
     private long enemyAtTick = NEVER;
+
+    /** 判断一个实体对玩家是否构成「威胁」（不止于 Enemy 子类）。 */
+    private static boolean isHostile(Entity e, LocalPlayer p) {
+        if (e instanceof Enemy) return true;
+        if (e instanceof Mob m && m.getTarget() == p) return true;
+        if (p.getLastHurtByMob() == e) return true;
+        return false;
+    }
 
     /** 上一拍坐标，用于卡住判定。 */
     private double lastX, lastY, lastZ;
@@ -133,6 +169,18 @@ public final class Sensor {
      */
     public WorldView sense(Minecraft mc, long tick, boolean armed) {
         buildTables();
+
+        // 感知半径跟随「你能看到多远」：渲染距离越大，能察觉的敌人/资源越远。
+        // 这样「屏幕多大看到多大」，而不是写死的 24/14 格。
+        int rd = 12;
+        try {
+            Integer v = mc.options.renderDistance().get();
+            if (v != null) rd = v;
+        } catch (Exception ignore) {
+            // 某些版本 OptionInstance.get 可能抛；用默认值兜底
+        }
+        enemyRadius = Math.min(160f, Math.max(ENEMY_RADIUS, rd * 16f));
+        resourceRadius = Math.min(56f, Math.max(RESOURCE_RADIUS, rd * 8f));
 
         WorldView w = new WorldView();
         w.tick = tick;
@@ -178,7 +226,15 @@ public final class Sensor {
         // 有明确扫描结果：能确定有没有敌人。扫不到就保持未知。
         w.threat = enemyCount == null ? Tri.ZERO : (enemyCount > 0 ? Tri.POS : Tri.NEG);
         if (targetId >= 0 && targetXyz != null) {
-            float[] rel = relativeAngles(p, targetXyz[0], targetXyz[1], targetXyz[2]);
+            // 预测：朝目标「未来位置」瞄准（提前量），移动目标不用再描后脑勺
+            double tx = targetXyz[0], ty = targetXyz[1], tz = targetXyz[2];
+            if (targetVel != null && w.dist != null) {
+                float lead = Math.min(16f, w.dist / 2.5f);
+                tx += targetVel[0] * lead;
+                ty += targetVel[1] * lead;
+                tz += targetVel[2] * lead;
+            }
+            float[] rel = relativeAngles(p, tx, ty, tz);
             w.yawToTarget = rel[0];
             w.pitchToTarget = rel[1];
         }
@@ -206,6 +262,17 @@ public final class Sensor {
         scanWallAndStep(level, p);
         attachTerrainTo(w);
         scanInteractionAndGear(mc, level, p, w);
+        scanFollowTarget(level, p, w);
+
+        // 准星所指方块的角度与可挖性（卡住开路用）
+        if (w.frontPos != null) {
+            float[] rel = relativeAngles(p, w.frontPos[0] + 0.5, w.frontPos[1] + 0.5, w.frontPos[2] + 0.5);
+            w.yawToFront = rel[0];
+            w.pitchToFront = rel[1];
+            String f = w.blkFront;
+            w.canDigFront = f != null && !f.equals("air") && !f.equals("hazard")
+                    && !f.equals("fluid") && !f.equals("log") && !f.equals("ore");
+        }
 
         // 准星指向的方块
         HitResult hit = mc.hitResult;
@@ -240,6 +307,16 @@ public final class Sensor {
         enemyAtTick = NEVER;
         stillTicks = 0;
         hasLast = false;
+        lastTargetPos.clear();
+        lastTargetTick.clear();
+    }
+
+    /**
+     * 由环盘菜单在选定「跟随」时调用：把准星所指的实体设为固定跟随目标。
+     * 传 null 表示取消指定，改回「跟随最近玩家」。
+     */
+    public void setForcedFollow(Integer entityId) {
+        forcedFollowId = entityId;
     }
 
     // ------------------------------------------------------------------
@@ -253,12 +330,11 @@ public final class Sensor {
         int bestId = -1;
         double[] bestXyz = null;
 
-        double r2 = (double) ENEMY_RADIUS * ENEMY_RADIUS;
+        double r2 = (double) enemyRadius * enemyRadius;
         for (Entity e : level.entitiesForRendering()) {
             if (e == p) continue;
-            if (!(e instanceof LivingEntity le)) continue;
-            if (!(e instanceof Enemy)) continue;
-            if (le.isDeadOrDying()) continue;
+            if (!(e instanceof LivingEntity le) || le.isDeadOrDying()) continue;
+            if (!isHostile(e, p)) continue;
             double d2 = e.distanceToSqr(p);
             if (d2 > r2) continue;
             count++;
@@ -269,17 +345,34 @@ public final class Sensor {
             }
         }
 
-        if (best == Double.MAX_VALUE) {
+        if (bestId < 0) {
             enemyDist = null;
             enemyCount = 0;
             targetId = -1;
             targetXyz = null;
-        } else {
-            enemyDist = (float) Math.sqrt(best);
-            enemyCount = count;
-            targetId = bestId;
-            targetXyz = bestXyz;
+            targetVel = null;
+            return;
         }
+        enemyDist = (float) Math.sqrt(best);
+        enemyCount = count;
+        targetId = bestId;
+
+        // 速度估计 → 提前量（预测）瞄准移动目标
+        double[] prev = lastTargetPos.get(bestId);
+        long prevT = lastTargetTick.getOrDefault(bestId, tick);
+        if (prev != null) {
+            long dt = Math.max(1, tick - prevT);
+            targetVel = new double[]{
+                    (bestXyz[0] - prev[0]) / dt,
+                    (bestXyz[1] - prev[1]) / dt,
+                    (bestXyz[2] - prev[2]) / dt
+            };
+        } else {
+            targetVel = new double[]{0, 0, 0};
+        }
+        lastTargetPos.put(bestId, bestXyz.clone());
+        lastTargetTick.put(bestId, tick);
+        targetXyz = bestXyz;
     }
 
     private void scanResources(ClientLevel level, LocalPlayer p, long tick) {
@@ -289,7 +382,7 @@ public final class Sensor {
         int cx = p.blockPosition().getX();
         int cy = p.blockPosition().getY();
         int cz = p.blockPosition().getZ();
-        int r = (int) RESOURCE_RADIUS;
+        int r = (int) resourceRadius;
 
         double bestWood = Double.MAX_VALUE;
         int[] bestWoodPos = null;
@@ -463,11 +556,12 @@ public final class Sensor {
      * </ul>
      */
     private void scanInteractionAndGear(Minecraft mc, ClientLevel level, LocalPlayer p, WorldView w) {
-        // 玩家自身操作：物理按键或正在破坏方块 → 让权
+        // 玩家自身操作：物理按键或正在破坏方块 → 让权。
+        // 26.3 的蹲下键是 keyShift（没有独立 keyCrouch），漏掉它就会「你一蹲下 AI 还在抢」。
         boolean key = mc.options.keyUp.isDown() || mc.options.keyDown.isDown()
                 || mc.options.keyLeft.isDown() || mc.options.keyRight.isDown()
                 || mc.options.keyJump.isDown() || mc.options.keyAttack.isDown()
-                || mc.options.keyUse.isDown();
+                || mc.options.keyUse.isDown() || mc.options.keyShift.isDown();
         boolean breaking = mc.gameMode != null && mc.gameMode.isDestroying();
         w.humanActing = key || breaking;
 
@@ -574,5 +668,56 @@ public final class Sensor {
         if (ORES.contains(b)) return "ore";
         if (b == Blocks.WATER) return "fluid";
         return "solid";
+    }
+
+    // ------------------------------------------------------------------
+    // 跟随目标：环盘菜单选「跟随」时，若准星指着某个实体就固定跟它；
+    // 否则默认跟最近的「其他玩家」，再退一步跟最近的非敌意活体（动物等）。
+    // ------------------------------------------------------------------
+    private void scanFollowTarget(ClientLevel level, LocalPlayer p, WorldView w) {
+        w.followId = -1;
+        w.followXyz = null;
+        w.followYaw = null;
+        w.followPitch = null;
+
+        Entity pick = null;
+        if (forcedFollowId != null) {
+            Entity e = level.getEntity(forcedFollowId);
+            if (e != null && e.isAlive() && e != p) {
+                pick = e;
+            } else {
+                forcedFollowId = null; // 目标没了，退回默认
+            }
+        }
+        if (pick == null) {
+            double best = Double.MAX_VALUE;
+            for (AbstractClientPlayer pl : level.players()) {
+                if (pl == p) continue;
+                double d2 = pl.distanceToSqr(p);
+                if (d2 < best) {
+                    best = d2;
+                    pick = pl;
+                }
+            }
+        }
+        if (pick == null) {
+            double best = Double.MAX_VALUE;
+            for (Entity e : level.entitiesForRendering()) {
+                if (e == p || !(e instanceof LivingEntity le) || le.isDeadOrDying() || e instanceof Enemy) continue;
+                double d2 = e.distanceToSqr(p);
+                if (d2 < best) {
+                    best = d2;
+                    pick = e;
+                }
+            }
+        }
+        if (pick == null) return;
+
+        double[] xyz = new double[]{pick.getX(), pick.getY() + pick.getBbHeight() * 0.5, pick.getZ()};
+        w.followId = pick.getId();
+        w.followXyz = xyz;
+        float[] rel = relativeAngles(p, xyz[0], xyz[1], xyz[2]);
+        w.followYaw = rel[0];
+        w.followPitch = rel[1];
     }
 }
