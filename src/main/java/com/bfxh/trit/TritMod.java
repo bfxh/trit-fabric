@@ -6,6 +6,7 @@ import com.bfxh.trit.behave.Behaviors;
 import com.bfxh.trit.core.Channel;
 import com.bfxh.trit.core.Decision;
 import com.bfxh.trit.core.Machine;
+import com.bfxh.trit.core.Mode;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Vote;
 import com.bfxh.trit.core.WorldView;
@@ -14,6 +15,8 @@ import com.mojang.blaze3d.platform.InputConstants;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -35,6 +38,15 @@ import java.util.List;
  *       不需要窗口焦点，也不会在进程崩溃后把按键卡住。</li>
  *   <li>状态机逻辑本身（K3 三值 + 投票 + 裁决 + 迟滞）原样保留。</li>
  * </ul>
+ *
+ * <p>26.3 适配要点：
+ * <ul>
+ *   <li>「环盘菜单」不再用会暂停游戏的 {@code Screen}（26.3 的 Screen 渲染模型大改），
+ *       而是注册成一个始终参与 HUD 抽取的 {@code HudElement} 叠层；菜单开着世界照样跑，
+ *       你也能照常操作。</li>
+ *   <li>26.3 没有 {@code mc.screen} 访问器，检测「你是不是在开背包/聊天」改走
+ *       Fabric 的 {@link ScreenEvents}；一旦原生界面开着，AI 立刻让权，绝不抢控制权。</li>
+ * </ul>
  */
 public class TritMod implements ClientModInitializer {
 
@@ -50,11 +62,31 @@ public class TritMod implements ClientModInitializer {
     private final Behaviors.Anchor anchor = new Behaviors.Anchor();
     private final Behavior[] behaviors = Behaviors.defaults(anchor);
 
-    private KeyMapping kToggle;
+    /** 环盘菜单选出的主动模式（默认交还控制权）。 */
+    private Mode mode = Mode.OFF;
+
+    /** 环盘菜单的选项，顺序即方位。 */
+    private static final Mode[] MENU_OPTIONS = {
+            Mode.PATROL, Mode.FORAGE, Mode.COMBAT, Mode.BUILD, Mode.FOLLOW, Mode.OFF
+    };
+    /** 环盘菜单是否打开（HUD 叠层，不暂停游戏）。 */
+    private boolean menuOpen;
+    /** 当前高亮选项下标。 */
+    private int menuSel;
+    /** 是否打开了原生界面（背包/聊天/任务栏等）：打开时 AI 必须让权。 */
+    private boolean nativeScreenOpen;
+
+    private KeyMapping kMenu;
     private KeyMapping kHalt;
     private KeyMapping kView;
     private KeyMapping kAttack;
     private KeyMapping kMove;
+    // 环盘菜单导航键
+    private KeyMapping kMenuPrev;
+    private KeyMapping kMenuNext;
+    private KeyMapping kMenuConfirm;
+    private KeyMapping kMenuCancel;
+    private KeyMapping[] kMenuDigit = new KeyMapping[6];
 
     private long tick;
     private boolean moveEnabled = true;
@@ -72,8 +104,8 @@ public class TritMod implements ClientModInitializer {
         KeyMapping.Category cat = KeyMapping.Category.register(
                 Identifier.fromNamespaceAndPath(MOD_ID, "main"));
 
-        kToggle = KeyMappingHelper.registerKeyMapping(
-                new KeyMapping("key." + MOD_ID + ".toggle", InputConstants.KEY_F8, cat));
+        kMenu = KeyMappingHelper.registerKeyMapping(
+                new KeyMapping("key." + MOD_ID + ".menu", InputConstants.KEY_Y, cat));
         kHalt = KeyMappingHelper.registerKeyMapping(
                 new KeyMapping("key." + MOD_ID + ".halt", InputConstants.KEY_F9, cat));
         kView = KeyMappingHelper.registerKeyMapping(
@@ -83,12 +115,50 @@ public class TritMod implements ClientModInitializer {
         kMove = KeyMappingHelper.registerKeyMapping(
                 new KeyMapping("key." + MOD_ID + ".move", InputConstants.KEY_F7, cat));
 
+        // 菜单导航键（与游戏默认移动键不冲突：方向键 / 数字键 / 回车 / 退格）
+        kMenuPrev = KeyMappingHelper.registerKeyMapping(
+                new KeyMapping("key." + MOD_ID + ".menu.prev", InputConstants.KEY_LEFT, cat));
+        kMenuNext = KeyMappingHelper.registerKeyMapping(
+                new KeyMapping("key." + MOD_ID + ".menu.next", InputConstants.KEY_RIGHT, cat));
+        kMenuConfirm = KeyMappingHelper.registerKeyMapping(
+                new KeyMapping("key." + MOD_ID + ".menu.confirm", InputConstants.KEY_RETURN, cat));
+        kMenuCancel = KeyMappingHelper.registerKeyMapping(
+                new KeyMapping("key." + MOD_ID + ".menu.cancel", InputConstants.KEY_BACKSPACE, cat));
+        for (int i = 0; i < 6; i++) {
+            kMenuDigit[i] = KeyMappingHelper.registerKeyMapping(
+                    new KeyMapping("key." + MOD_ID + ".menu.d" + i, InputConstants.KEY_1 + i, cat));
+        }
+
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
-        LOG.info("[TRIT] 已加载。F8 接管/交还，F9 急停，F10 视角，F6 攻击，F7 移动");
+
+        // 环盘菜单：注册成 HUD 叠层（26.3 不再有 GuiGraphics，改用 HudElement 抽取模型）
+        HudElementRegistry.addLast(Identifier.fromNamespaceAndPath(MOD_ID, "menu"), new TritHud(this));
+
+        // 跟踪原生界面开关：打开时 AI 让权，绝不抢你的操作（26.3 没有 mc.screen 访问器）
+        ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
+            nativeScreenOpen = true;
+            ScreenEvents.remove(screen).register((s) -> nativeScreenOpen = false);
+        });
+
+        LOG.info("[TRIT] 已加载。按 Y 打开环盘菜单选择模式，F9 急停，F10 视角，F6 攻击，F7 移动");
     }
 
     public static TritMod get() {
         return instance;
+    }
+
+    // ---- 给 HUD 叠层读的状态 ----
+
+    public boolean isMenuOpen() {
+        return menuOpen;
+    }
+
+    public int menuSelection() {
+        return menuSel;
+    }
+
+    public Mode[] menuOptions() {
+        return MENU_OPTIONS;
     }
 
     // ------------------------------------------------------------------
@@ -96,7 +166,14 @@ public class TritMod implements ClientModInitializer {
     private void onTick(Minecraft mc) {
         tick++;
 
-        handleHotkeys(mc);
+        // 原生界面开着时顺手关掉自己的菜单，避免两套 UI 叠在一起
+        if (nativeScreenOpen && menuOpen) menuOpen = false;
+
+        if (menuOpen) {
+            handleMenu(mc);
+        } else if (!nativeScreenOpen) {
+            handleHotkeys(mc);
+        }
 
         LocalPlayer p = mc.player;
         if (p == null || mc.level == null) {
@@ -106,24 +183,41 @@ public class TritMod implements ClientModInitializer {
             return;
         }
 
+        // 菜单开着：AI 完全让权，玩家自由操作选模式
+        if (menuOpen) {
+            if (actuator.isAttached()) actuator.detach(p);
+            return;
+        }
+
         if (!machine.armed()) {
             if (actuator.isAttached()) actuator.detach(p);
             return;
         }
 
-        actuator.attach(p);
-
         if (sensor == null) sensor = new Sensor();
+        // 跟随模式：锚点始终跟在玩家身上，表现为「跟着你走」
+        if (mode == Mode.FOLLOW) {
+            anchor.setAnchor(new double[]{p.getX(), p.getY(), p.getZ()});
+        }
 
         // 1) 感知
         WorldView w = sensor.sense(mc, tick, true);
         lastView = w;
 
+        // 玩家自己操作时（按移动/攻击/使用键，或正在破坏方块，或开了原生界面）→ 全部让权
+        boolean yieldAll = w.humanActing || nativeScreenOpen;
+        if (yieldAll) {
+            actuator.detach(p); // 交还物理输入给玩家（幂等）
+            return;
+        }
+
+        actuator.attach(p);
+
         // 2) 先 peek 阶段，行为模块才知道该投什么票
         Phase phase = machine.peek(w);
 
         // 3) 投票
-        Behavior.Ctx ctx = new Behavior.Ctx(w, phase, machine, tick);
+        Behavior.Ctx ctx = new Behavior.Ctx(w, phase, machine, tick, mode);
         List<Vote> votes = new ArrayList<>(24);
         for (Behavior b : behaviors) {
             try {
@@ -146,13 +240,15 @@ public class TritMod implements ClientModInitializer {
 
         // 4) 裁决
         boolean[] enabled = new boolean[Channel.NCH];
+        java.util.Arrays.fill(enabled, true);
         enabled[Channel.FORWARD.index()] = moveEnabled;
         enabled[Channel.STRAFE.index()] = moveEnabled;
         enabled[Channel.JUMP.index()] = moveEnabled;
         enabled[Channel.YAW.index()] = viewEnabled;
         enabled[Channel.PITCH.index()] = viewEnabled;
         enabled[Channel.ATTACK.index()] = attackEnabled;
-        enabled[Channel.USE.index()] = true;
+        enabled[Channel.RANGED.index()] = attackEnabled;
+        // USE / CROUCH / PLACE 默认开，由行为层按需投票
 
         Decision d = machine.step(w, votes, enabled);
         lastDecision = d;
@@ -167,12 +263,13 @@ public class TritMod implements ClientModInitializer {
     }
 
     private void handleHotkeys(Minecraft mc) {
-        if (kToggle == null) return;
-        if (kToggle.consumeClick()) {
-            setArmed(mc, !machine.armed(), null);
+        if (kMenu == null) return;
+        if (kMenu.consumeClick()) {
+            openMenu(mc);
         }
         if (kHalt.consumeClick()) {
-            setArmed(mc, false, "§c[TRIT] 急停：全部松手");
+            applyMode(Mode.OFF);
+            notify(mc, "§c[TRIT] 急停：全部松手");
         }
         if (kView.consumeClick()) {
             viewEnabled = !viewEnabled;
@@ -188,24 +285,71 @@ public class TritMod implements ClientModInitializer {
         }
     }
 
-    /**
-     * @param message 自定义提示；null 用默认文案。急停和交还是同一件事，
-     *                不给自定义就会连着弹两条重复消息。
-     */
-    private void setArmed(Minecraft mc, boolean on, String message) {
-        machine.setArmed(on);
+    /** 菜单打开时的导航：方向键选、Y/回车确认、退格取消、数字键直达。 */
+    private void handleMenu(Minecraft mc) {
+        if (kMenuPrev.consumeClick()) {
+            menuSel = (menuSel - 1 + MENU_OPTIONS.length) % MENU_OPTIONS.length;
+        }
+        if (kMenuNext.consumeClick()) {
+            menuSel = (menuSel + 1) % MENU_OPTIONS.length;
+        }
+        for (int i = 0; i < kMenuDigit.length; i++) {
+            if (kMenuDigit[i].consumeClick()) {
+                menuSel = i;
+                confirmMenu(mc);
+                return;
+            }
+        }
+        if (kMenu.consumeClick() || kMenuConfirm.consumeClick()) {
+            confirmMenu(mc);
+            return;
+        }
+        if (kMenuCancel.consumeClick()) {
+            menuOpen = false;
+        }
+    }
+
+    /** 打开环盘菜单（HUD 叠层，不暂停游戏）。 */
+    private void openMenu(Minecraft mc) {
+        if (nativeScreenOpen) return;
+        menuSel = 0;
+        for (int i = 0; i < MENU_OPTIONS.length; i++) {
+            if (MENU_OPTIONS[i] == mode) {
+                menuSel = i;
+                break;
+            }
+        }
+        menuOpen = true;
+    }
+
+    private void confirmMenu(Minecraft mc) {
+        applyMode(MENU_OPTIONS[menuSel]);
+        menuOpen = false;
+    }
+
+    /** 由环盘菜单调用：选定一个模式并接管（OFF = 交还）。 */
+    public void applyMode(Mode m) {
+        Minecraft mc = Minecraft.getInstance();
         LocalPlayer p = mc.player;
-        if (on) {
+        if (m == Mode.OFF) {
+            machine.setArmed(false);
+            mode = Mode.OFF;
+            if (p != null) actuator.detach(p);
+            notify(mc, "§c[TRIT] 已交还控制权");
+        } else {
+            machine.setArmed(true);
+            mode = m;
             if (sensor != null) sensor.reset();
             if (p != null) {
                 anchor.setAnchor(new double[]{p.getX(), p.getY(), p.getZ()});
                 actuator.attach(p);
             }
-            notify(mc, message != null ? message : "§a[TRIT] 已接管 —— 再按 F8 交还");
-        } else {
-            if (p != null) actuator.detach(p);
-            notify(mc, message != null ? message : "§c[TRIT] 已交还控制权");
+            notify(mc, "§a[TRIT] 模式：" + m.zh() + " —— 按 Y 再打开环盘菜单切换");
         }
+    }
+
+    public Mode currentMode() {
+        return mode;
     }
 
     private static void notify(Minecraft mc, String msg) {
@@ -219,7 +363,8 @@ public class TritMod implements ClientModInitializer {
     /** action bar 上的一行状态。 */
     private String statusLine() {
         if (lastView == null || lastDecision == null) return "[TRIT] --";
-        return String.format("[TRIT] %s %s | %s | %s",
+        return String.format("[TRIT] <%s> %s %s | %s | %s",
+                mode.id(),
                 lastDecision.phase.zh(),
                 lastDecision.encode(),
                 lastView.summary(),

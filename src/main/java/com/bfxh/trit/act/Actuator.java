@@ -16,7 +16,16 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.BowItem;
+import net.minecraft.world.item.CrossbowItem;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.tags.ItemTags;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.function.Predicate;
 
 /**
  * 执行层：把裁决结果写进游戏。
@@ -49,6 +58,11 @@ public final class Actuator {
     private int[] miningPos;
     /** 是否由我们发起了「按住右键」（进食）。交还控制权前必须松开。 */
     private boolean holdingUse;
+    /** 弓蓄力状态机：bowing = 正在拉弓，bowCharge = 已蓄的拍数。 */
+    private boolean bowing;
+    private int bowCharge;
+    /** 弓拉满需要的拍数（约 1.1 秒）。 */
+    private static final int BOW_TICKS = 22;
 
     public boolean isAttached() {
         return attached;
@@ -109,6 +123,9 @@ public final class Actuator {
         Tri jump = d.dirs[Channel.JUMP.index()];
         Tri use = d.dirs[Channel.USE.index()];
         Tri attack = d.dirs[Channel.ATTACK.index()];
+        Tri crouch = d.dirs[Channel.CROUCH.index()];
+        Tri ranged = d.dirs[Channel.RANGED.index()];
+        Tri place = d.dirs[Channel.PLACE.index()];
 
         boolean sprint = fwd == Tri.POS && d.phase != Phase.RETREAT && w.hp != null && w.hp > 0.5f;
 
@@ -119,7 +136,7 @@ public final class Actuator {
                     strafe == Tri.POS,
                     strafe == Tri.NEG,
                     jump == Tri.POS,
-                    false,
+                    crouch == Tri.POS,
                     sprint
             );
         } else {
@@ -163,17 +180,25 @@ public final class Actuator {
             releaseUse(mc, p);
         }
 
-        // 左键
-        if (!attackEnabled || attack == Tri.ZERO) {
-            stopMining(mc);
-            return;
-        }
+        // 远程：拉弓射击（与近战互斥，由行为层按距离 / 视线决定走哪条）
+        handleRanged(mc, p, w, ranged, attackEnabled);
 
-        if (d.attackHold) {
-            mine(mc, w);
+        // 左键：持续采矿 或 近战脉冲
+        if (attackEnabled && attack != Tri.ZERO) {
+            if (d.attackHold) {
+                mine(mc, w);
+            } else {
+                stopMining(mc);
+                ensureMelee(p);
+                strike(mc, w);
+            }
         } else {
             stopMining(mc);
-            strike(mc, w);
+        }
+
+        // 放方块（搭桥 / 填坑）
+        if (place == Tri.POS) {
+            handlePlace(mc, p, w);
         }
     }
 
@@ -226,6 +251,82 @@ public final class Actuator {
         } else {
             gm.continueDestroyBlock(pos, dir);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 远程 / 放置 / 武器选择
+    // ------------------------------------------------------------------
+
+    /** 拉弓 → 蓄满 → 松手射出。中间任何一拍断了（目标没了 / 关了攻击）就取消。 */
+    private void handleRanged(Minecraft mc, LocalPlayer p, WorldView w, Tri ranged, boolean attackEnabled) {
+        boolean want = ranged == Tri.POS && attackEnabled
+                && w.hasBow == Boolean.TRUE && w.hasAmmo == Boolean.TRUE;
+        if (!want) {
+            if (bowing) {
+                mc.gameMode.releaseUsingItem(p);
+                bowing = false;
+                bowCharge = 0;
+            }
+            return;
+        }
+        if (!bowing) {
+            ensureRanged(p);
+            bowing = true;
+            bowCharge = 0;
+            mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
+        }
+        if (bowCharge < BOW_TICKS) {
+            bowCharge++;
+        } else {
+            mc.gameMode.releaseUsingItem(p);
+            bowing = false;
+            bowCharge = 0;
+        }
+    }
+
+    /** 在正前方的坑里放一格方块（搭桥 / 填坑）。 */
+    private void handlePlace(Minecraft mc, LocalPlayer p, WorldView w) {
+        if (w.hasBlocks != Boolean.TRUE || w.gapAhead != Boolean.TRUE) return;
+        int slot = findSlot(p, it -> it.getItem() instanceof BlockItem);
+        if (slot < 0) return;
+        p.getInventory().setSelectedSlot(slot);
+        BlockPos base = p.blockPosition();
+        double a = Math.toRadians(p.getYRot());
+        int dx = (int) Math.round(-Math.sin(a));
+        int dz = (int) Math.round(Math.cos(a));
+        BlockPos gap = new BlockPos(base.getX() + dx, base.getY(), base.getZ() + dz);
+        if (!mc.level.getBlockState(gap).isAir()) return;
+        BlockHitResult hit = new BlockHitResult(
+                new Vec3(gap.getX() + 0.5, gap.getY() + 0.5, gap.getZ() + 0.5),
+                Direction.UP, gap, false);
+        mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, hit);
+    }
+
+    /** 战斗近战前确保主手是剑 / 斧，最大化 dps。 */
+    private static void ensureMelee(LocalPlayer p) {
+        ItemStack cur = p.getInventory().getItem(p.getInventory().getSelectedSlot());
+        if (isMeleeWeapon(cur)) return;
+        int s = findSlot(p, it -> isMeleeWeapon(it));
+        if (s >= 0) p.getInventory().setSelectedSlot(s);
+    }
+
+    /** 远程前确保主手是弓 / 弩。 */
+    private static void ensureRanged(LocalPlayer p) {
+        int s = findSlot(p, it -> it.getItem() instanceof BowItem || it.getItem() instanceof CrossbowItem);
+        if (s >= 0) p.getInventory().setSelectedSlot(s);
+    }
+
+    private static int findSlot(LocalPlayer p, Predicate<ItemStack> pred) {
+        for (int i = 0; i < p.getInventory().getContainerSize(); i++) {
+            ItemStack s = p.getInventory().getItem(i);
+            if (!s.isEmpty() && pred.test(s)) return i;
+        }
+        return -1;
+    }
+
+    /** 26.3 没有 SwordItem / AxeItem 子类了，用物品标签判定近战武器。 */
+    private static boolean isMeleeWeapon(ItemStack s) {
+        return !s.isEmpty() && s.is(h -> h.is(ItemTags.SWORDS) || h.is(ItemTags.AXES));
     }
 
     private void stopMining(Minecraft mc) {

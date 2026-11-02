@@ -5,6 +5,7 @@ import com.bfxh.trit.behave.Behaviors;
 import com.bfxh.trit.core.Channel;
 import com.bfxh.trit.core.Decision;
 import com.bfxh.trit.core.Machine;
+import com.bfxh.trit.core.Mode;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Tri;
 import com.bfxh.trit.core.Vote;
@@ -52,7 +53,7 @@ public final class SimTest {
         eq("巡逻前进", Tri.POS, d.dirs[Channel.FORWARD.index()]);
     }
 
-    /** 5 格外的树 → 走过去。 */
+    /** 5 格外的树 → 走过去（采集模式）。 */
     private static void forageWalksToTree() {
         WorldView w = base();
         w.resourcePos = new int[]{10, 64, 0};
@@ -60,11 +61,11 @@ public final class SimTest {
         w.wood = 5f;
         w.yawToResource = 0f;
         w.pitchToResource = 0f;
-        Decision d = run(w);
+        Decision d = run(w, Mode.FORAGE);
         eq("采集：走向树", Tri.POS, d.dirs[Channel.FORWARD.index()]);
     }
 
-    /** 已经贴着树 → 站住不动，按住左键挖。 */
+    /** 已经贴着树 → 站住不动，按住左键挖（采集模式）。 */
     private static void forageStandsAndMines() {
         WorldView w = base();
         w.resourcePos = new int[]{6, 64, 0};
@@ -72,7 +73,7 @@ public final class SimTest {
         w.wood = 1.5f;
         w.yawToResource = 0f;
         w.pitchToResource = 0f;
-        Decision d = run(w);
+        Decision d = run(w, Mode.FORAGE);
         eq("贴着树：不再前进", Tri.ZERO, d.dirs[Channel.FORWARD.index()]);
         eq("贴着树：挖", Tri.POS, d.dirs[Channel.ATTACK.index()]);
         check("贴着树：按住不放", d.attackHold);
@@ -177,10 +178,14 @@ public final class SimTest {
 
     /** 跑一整拍：peek → 投票 → 裁决。 */
     private static Decision run(WorldView w) {
+        return run(w, Mode.PATROL);
+    }
+
+    private static Decision run(WorldView w, Mode mode) {
         Machine m = new Machine();
         m.setArmed(true);
         Phase phase = m.peek(w);
-        Behavior.Ctx ctx = new Behavior.Ctx(w, phase, m, 1L);
+        Behavior.Ctx ctx = new Behavior.Ctx(w, phase, m, 1L, mode);
         List<Vote> votes = new ArrayList<>();
         for (Behavior b : Behaviors.defaults(new Behaviors.Anchor())) {
             b.vote(ctx, votes);

@@ -3,6 +3,10 @@ package com.bfxh.trit.core;
 /**
  * 裁决通道：每个「次操作」一条。行为模块独立往这些通道上投票，
  * 由 {@link Machine} 汇总裁决。
+ *
+ * <p>新增的 CROUCH / RANGED / PLACE 是「离散能力」通道：三值在这里表达的是
+ * 意图（POS = 执行 / ZERO = 不干预 / NEG = 反向或取消），由 {@code Actuator}
+ * 翻译成具体游戏操作（蹲下、拉弓、放方块）。
  */
 public enum Channel {
     /** 前后：POS = W，NEG = S */
@@ -13,14 +17,20 @@ public enum Channel {
     YAW(2, "yaw", 2, 1),
     /** 垂直视角：POS = 下看，NEG = 上看 */
     PITCH(3, "pitch", 2, 2),
-    /** 左键 */
+    /** 左键（近战 / 采矿）。 */
     ATTACK(4, "attack", 1, 1),
     /** 空格 */
     JUMP(5, "jump", 1, 2),
-    /** 右键 / 使用 */
-    USE(6, "use", 2, 2);
+    /** 右键 / 使用（进食、拉弓蓄力）。 */
+    USE(6, "use", 2, 2),
+    /** 蹲下：POS = 蹲，ZERO/NEG = 站。 */
+    CROUCH(7, "crouch", 1, 1),
+    /** 远程：POS = 用弓/弩射击，ZERO/NEG = 近战。 */
+    RANGED(8, "ranged", 1, 1),
+    /** 放置方块：POS = 在准星/脚下放一格，ZERO/NEG = 不放。 */
+    PLACE(9, "place", 1, 1);
 
-    public static final int NCH = 7;
+    public static final int NCH = 10;
 
     private final int index;
     private final String name;

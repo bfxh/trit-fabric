@@ -87,6 +87,32 @@ public final class WorldView {
     /** 准星命中面的方向序号（0..5），对应 Direction.values()。null = 无。 */
     public Integer frontFace;
 
+    // ---- 交互 / 装备 / 地形（灵性操作需要的信号）----
+
+    /**
+     * 玩家自己正在操作（按移动/攻击/使用键，或正在破坏方块）。
+     * 这个为真时 AI 必须<strong>全部让权</strong>，绝不抢控制权。
+     */
+    public boolean humanActing;
+    /** 采集目标被遮挡（视线被方块挡住，挖不到也瞄不准）。null = 未判定。 */
+    public Boolean resourceOccluded;
+    /** 战斗目标被遮挡（隔着墙打不到）。null = 未判定。 */
+    public Boolean targetOccluded;
+    /** 背包里有弓/弩。null = 未知。 */
+    public Boolean hasBow;
+    /** 背包里有箭（或弩已上膛）。null = 未知。 */
+    public Boolean hasAmmo;
+    /** 背包里有可放置的方块（用于填坑/搭桥）。null = 未知。 */
+    public Boolean hasBlocks;
+    /** 脚下的方块坐标，放方块时作为落点参考。null = 无。 */
+    public int[] footPos;
+    /** 是否站在地面上（用于判断是否要落地 / 掉坑）。 */
+    public Boolean onGround;
+    /** 脚下是否泡在液体里。 */
+    public Boolean inLiquid;
+    /** 正前方一格是坑或液体（需要搭桥）。null = 未判定。 */
+    public Boolean gapAhead;
+
     public long tick;
 
     /**
@@ -134,6 +160,16 @@ public final class WorldView {
         c.resourceDist = resourceDist;
         c.frontPos = frontPos == null ? null : frontPos.clone();
         c.frontFace = frontFace;
+        c.humanActing = humanActing;
+        c.resourceOccluded = resourceOccluded;
+        c.targetOccluded = targetOccluded;
+        c.hasBow = hasBow;
+        c.hasAmmo = hasAmmo;
+        c.hasBlocks = hasBlocks;
+        c.footPos = footPos == null ? null : footPos.clone();
+        c.onGround = onGround;
+        c.inLiquid = inLiquid;
+        c.gapAhead = gapAhead;
         c.tick = tick;
         return c;
     }

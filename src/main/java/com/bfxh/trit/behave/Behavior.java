@@ -1,6 +1,7 @@
 package com.bfxh.trit.behave;
 
 import com.bfxh.trit.core.Machine;
+import com.bfxh.trit.core.Mode;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Vote;
 import com.bfxh.trit.core.WorldView;
@@ -21,12 +22,15 @@ public interface Behavior {
         public final Phase phase;
         public final Machine machine;
         public final long tick;
+        /** 环盘菜单选出的主动模式，决定「没事干时主动干什么」。 */
+        public final Mode mode;
 
-        public Ctx(WorldView w, Phase phase, Machine machine, long tick) {
+        public Ctx(WorldView w, Phase phase, Machine machine, long tick, Mode mode) {
             this.w = w;
             this.phase = phase;
             this.machine = machine;
             this.tick = tick;
+            this.mode = mode;
         }
     }
 }

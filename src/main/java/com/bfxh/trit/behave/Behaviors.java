@@ -1,6 +1,7 @@
 package com.bfxh.trit.behave;
 
 import com.bfxh.trit.core.Channel;
+import com.bfxh.trit.core.Mode;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Tri;
 import com.bfxh.trit.core.Vote;
@@ -126,9 +127,20 @@ public final class Behaviors {
             // 绕圈：不站桩挨打
             out.add(Vote.of(Channel.STRAFE, flip(c.tick), 2, "combat_strafe"));
 
-            // 够得着就打
+            // 够得着就打（近战）
             if (d <= 3.2f && Math.abs(c.w.yawToTarget == null ? 999f : c.w.yawToTarget) < 45f) {
                 out.add(Vote.of(Channel.ATTACK, Tri.POS, 3, "combat"));
+            }
+
+            // 远程：有弓有箭、距离拉开、视线通畅 → 拉弓（与近战互斥，交给裁决）
+            if (c.w.hasBow == Boolean.TRUE && c.w.hasAmmo == Boolean.TRUE
+                    && d > 5f && c.w.targetOccluded != Boolean.TRUE) {
+                out.add(Vote.of(Channel.RANGED, Tri.POS, 4, "combat_ranged"));
+                // 蹲下稳准，别边跑边射
+                out.add(Vote.of(Channel.CROUCH, Tri.POS, 2, "combat_steady"));
+                // 拉弓期间站住，走动会打断蓄力
+                out.add(Vote.abstain(Channel.FORWARD, 3, "combat_aim_still"));
+                out.add(Vote.abstain(Channel.STRAFE, 3, "combat_aim_still"));
             }
 
             // 打不过就跳一跳（暴击 + 打乱对方预判）
@@ -195,6 +207,8 @@ public final class Behaviors {
 
         @Override
         public void vote(Behavior.Ctx c, List<Vote> out) {
+            // 只在「采集模式」主动找树/矿；其它模式不抢着挖，避免和你抢控制权
+            if (c.mode != Mode.FORAGE) return;
             if (c.phase != Phase.IDLE) return;
             // 血量太低先别干活
             if (c.w.hp != null && c.w.hp < 0.35f) return;
@@ -222,8 +236,19 @@ public final class Behaviors {
                 if (c.w.step == Boolean.TRUE) {
                     out.add(Vote.of(Channel.JUMP, Tri.POS, 3, "forage_step_up"));
                 }
+                // 被遮挡（隔着墙/树）：别硬冲，绕一下找能下手的角
+                if (c.w.resourceOccluded == Boolean.TRUE) {
+                    out.add(Vote.of(Channel.STRAFE, flip(c.tick), 3, "forage_circle_occluded"));
+                }
             } else {
-                // 到位了：站住挖。站着不动是刻意的 —— 走动会把准星带偏
+                // 到位了但视线被挡（比如树贴着墙、或自己卡在夹角）：
+                // 走过去贴脸 + 小幅绕，而不是站着对空气硬挖
+                if (c.w.resourceOccluded == Boolean.TRUE) {
+                    out.add(Vote.of(Channel.FORWARD, Tri.POS, 4, "forage_approach_occluded"));
+                    out.add(Vote.of(Channel.STRAFE, flip(c.tick), 3, "forage_circle_occluded"));
+                    return;
+                }
+                // 正常：站住挖。走动会把准星带偏
                 out.add(Vote.abstain(Channel.FORWARD, 5, "forage_hold"));
                 out.add(Vote.abstain(Channel.STRAFE, 4, "forage_hold"));
                 if (yaw == Tri.ZERO && pitch == Tri.ZERO) {
@@ -295,6 +320,51 @@ public final class Behaviors {
     }
 
     // ==================================================================
+    // 隐藏 / 蹲伏：有威胁但不在近战距离就蹲下降低存在感；
+    // 站在悬崖边蹲下防止被推下去。这是「灵性」的一部分。
+    // ==================================================================
+    public static final class Stealth implements Behavior {
+        @Override
+        public String name() {
+            return "stealth";
+        }
+
+        @Override
+        public void vote(Behavior.Ctx c, List<Vote> out) {
+            // 有威胁、又不是贴脸近战：蹲下藏一点（站桩挨打不如蹲着缩）
+            if (c.w.threat == Tri.POS && c.phase != Phase.ENGAGE) {
+                out.add(Vote.of(Channel.CROUCH, Tri.POS, 2, "stealth_threat"));
+            }
+            // 悬崖边且没在战斗：蹲下别往后退掉坑里
+            if (c.w.pit == Boolean.TRUE && c.phase != Phase.ENGAGE && c.phase != Phase.RETREAT) {
+                out.add(Vote.of(Channel.CROUCH, Tri.POS, 3, "stealth_edge"));
+            }
+        }
+    }
+
+    // ==================================================================
+    // 建造：前方是坑 / 液体，且背包有方块 → 放一块搭桥，别掉下去。
+    // 只在「建造模式」主动铺路；平时遇到坑由巡逻的跳/绕处理。
+    // ==================================================================
+    public static final class Build implements Behavior {
+        @Override
+        public String name() {
+            return "build";
+        }
+
+        @Override
+        public void vote(Behavior.Ctx c, List<Vote> out) {
+            if (c.mode != Mode.BUILD) return;
+            if (c.phase == Phase.ENGAGE || c.phase == Phase.RETREAT) return;
+            if (c.w.gapAhead != Boolean.TRUE) return;
+            if (c.w.hasBlocks != Boolean.TRUE) return;
+            // 前面是坑：放一块，同时站住别往前冲
+            out.add(Vote.of(Channel.PLACE, Tri.POS, 5, "build_bridge"));
+            out.add(Vote.abstain(Channel.FORWARD, 4, "build_hold"));
+        }
+    }
+
+    // ==================================================================
     // 锚点：离出发点太远就往回走，避免一路跑丢
     // ==================================================================
     public static final class Anchor implements Behavior {
@@ -344,6 +414,8 @@ public final class Behaviors {
                 new Eat(),
                 new Regen(),
                 new Forage(),
+                new Build(),
+                new Stealth(),
                 new Patrol(),
                 new IdleScan(),
                 anchor,

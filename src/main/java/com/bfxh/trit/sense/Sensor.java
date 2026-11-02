@@ -11,15 +11,23 @@ import net.minecraft.core.Direction;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.item.ArrowItem;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.BowItem;
+import net.minecraft.world.item.CrossbowItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Field;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /**
  * 感知层：直接从游戏世界读状态。
@@ -176,6 +184,14 @@ public final class Sensor {
         }
 
         scanResources(level, p, tick);
+        // 每拍校验采集目标是否还在：挖掉了立刻失效并强制重扫，
+        // 否则下一拍还对着空气硬挖（表现为「树挖完了还在搞 / 傻站着」）。
+        // 只在「上一拍确实有目标、这拍没了」时才重扫，无目标时不会每拍空扫。
+        if (stickyRes != null && !isResource(level, stickyRes)) {
+            stickyRes = null;
+            resAtTick = NEVER;
+            scanResources(level, p, tick);
+        }
         w.wood = woodDist;
         w.ore = oreDist;
         w.resourcePos = resPos;
@@ -189,6 +205,7 @@ public final class Sensor {
         scanHazard(level, p);
         scanWallAndStep(level, p);
         attachTerrainTo(w);
+        scanInteractionAndGear(mc, level, p, w);
 
         // 准星指向的方块
         HitResult hit = mc.hitResult;
@@ -345,6 +362,13 @@ public final class Sensor {
         return LOGS.contains(b) || ORES.contains(b);
     }
 
+    /** isResource 的 BlockPos 重载，给射线遮挡检测用。 */
+    private boolean isResource(ClientLevel level, BlockPos pos) {
+        if (pos == null) return false;
+        Block b = level.getBlockState(pos).getBlock();
+        return LOGS.contains(b) || ORES.contains(b);
+    }
+
     private static float distanceTo(LocalPlayer p, int[] pos) {
         double dx = pos[0] + 0.5 - p.getX();
         double dy = pos[1] + 0.5 - p.getY();
@@ -422,7 +446,104 @@ public final class Sensor {
         w.wall = wallMask;
         w.step = stepAhead;
         w.pit = pitAhead;
+        w.gapAhead = pitAhead;
         w.hazard = hazardTri;
+    }
+
+    /**
+     * 玩家交互 + 装备 + 地形细节。
+     *
+     * <p>这一块专门服务于「灵性操作」：
+     * <ul>
+     *   <li>{@code humanActing}：玩家自己按了移动/攻击/使用键，或正在破坏方块。
+     *       为真时 AI 必须全部让权，绝不抢控制权（这是「不干扰你挖矿」的硬保证）。</li>
+     *   <li>{@code resourceOccluded} / {@code targetOccluded}：射线步进判断视线被墙挡住，
+     *       挡住了就别傻站着硬挖/硬射，改为接近或绕行。</li>
+     *   <li>装备扫描：有没有弓、箭、可放置方块，决定能用远程还是只能近战、能不能填坑。</li>
+     * </ul>
+     */
+    private void scanInteractionAndGear(Minecraft mc, ClientLevel level, LocalPlayer p, WorldView w) {
+        // 玩家自身操作：物理按键或正在破坏方块 → 让权
+        boolean key = mc.options.keyUp.isDown() || mc.options.keyDown.isDown()
+                || mc.options.keyLeft.isDown() || mc.options.keyRight.isDown()
+                || mc.options.keyJump.isDown() || mc.options.keyAttack.isDown()
+                || mc.options.keyUse.isDown();
+        boolean breaking = mc.gameMode != null && mc.gameMode.isDestroying();
+        w.humanActing = key || breaking;
+
+        // 采集目标遮挡：射线打到「非资源方块」即视为被挡
+        if (resPos != null) {
+            Vec3 from = eyeVec(p);
+            Vec3 to = new Vec3(resPos[0] + 0.5, resPos[1] + 0.5, resPos[2] + 0.5);
+            w.resourceOccluded = lineBlocked(level, from, to, bp -> isResource(level, bp));
+        } else {
+            w.resourceOccluded = null;
+        }
+
+        // 战斗目标遮挡：射线打到任意实心方块即视为被挡
+        if (targetId >= 0 && targetXyz != null) {
+            Vec3 from = eyeVec(p);
+            Vec3 to = new Vec3(targetXyz[0], targetXyz[1], targetXyz[2]);
+            w.targetOccluded = lineBlocked(level, from, to, null);
+        } else {
+            w.targetOccluded = null;
+        }
+
+        // 装备扫描
+        boolean bow = false, ammo = false, blocks = false;
+        for (int i = 0; i < p.getInventory().getContainerSize(); i++) {
+            ItemStack s = p.getInventory().getItem(i);
+            if (s.isEmpty()) continue;
+            Item it = s.getItem();
+            if (it instanceof BowItem) {
+                bow = true;
+                if (hasArrow(p)) ammo = true;
+            } else if (it instanceof CrossbowItem) {
+                bow = true;
+                if (CrossbowItem.isCharged(s) || hasArrow(p)) ammo = true;
+            } else if (it instanceof BlockItem) {
+                blocks = true;
+            }
+        }
+        w.hasBow = bow;
+        w.hasAmmo = ammo;
+        w.hasBlocks = blocks;
+
+        w.footPos = new int[]{p.blockPosition().getX(), p.blockPosition().getY() - 1, p.blockPosition().getZ()};
+        w.onGround = p.onGround();
+        w.inLiquid = !level.getFluidState(p.blockPosition()).isEmpty()
+                || !level.getFluidState(p.blockPosition().below()).isEmpty();
+    }
+
+    /** 背包里有没有箭。crossbow 上膛也算有弹，但 isCharged 在上面单独判断了。 */
+    private static boolean hasArrow(LocalPlayer p) {
+        for (int i = 0; i < p.getInventory().getContainerSize(); i++) {
+            if (p.getInventory().getItem(i).getItem() instanceof ArrowItem) return true;
+        }
+        return false;
+    }
+
+    private static Vec3 eyeVec(LocalPlayer p) {
+        return new Vec3(p.getX(), p.getEyeY(), p.getZ());
+    }
+
+    /**
+     * 从 from 到 to 步进，遇到第一个「实心且不被 ignore 接受」的方块即返回 true。
+     *
+     * @param ignore 返回 true 的位置跳过（用于资源：整棵树都算视线通畅）。
+     */
+    private static boolean lineBlocked(ClientLevel level, Vec3 from, Vec3 to, Predicate<BlockPos> ignore) {
+        double dist = from.distanceTo(to);
+        int steps = (int) (dist / 0.25) + 1;
+        for (int i = 1; i < steps; i++) {
+            double t = (double) i / steps;
+            Vec3 pnt = from.lerp(to, t);
+            BlockPos bp = BlockPos.containing(pnt);
+            if (ignore != null && ignore.test(bp)) continue;
+            BlockState st = level.getBlockState(bp);
+            if (!st.isAir() && st.isSolid()) return true;
+        }
+        return false;
     }
 
     /**
