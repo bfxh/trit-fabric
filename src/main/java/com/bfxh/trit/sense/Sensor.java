@@ -438,7 +438,12 @@ public final class Sensor {
         };
     }
 
-    /** 把方块分成执行层够用的语义类别。 */
+    /**
+     * 把方块分成执行层够用的语义类别。
+     *
+     * <p>只分到「能不能挖、挖了会不会死」这个粒度就够了，再细反而要维护一张
+     * 随版本漂移的方块表。
+     */
     private String classify(ClientLevel level, BlockPos pos) {
         BlockState st = level.getBlockState(pos);
         if (st.isAir()) return "air";
@@ -448,10 +453,5 @@ public final class Sensor {
         if (ORES.contains(b)) return "ore";
         if (b == Blocks.WATER) return "fluid";
         return "solid";
-    }
-
-    /** 方位掩码取值，供行为模块用。 */
-    public static boolean wallAt(int mask, int dir) {
-        return (mask & (1 << (dir & 7))) != 0;
     }
 }

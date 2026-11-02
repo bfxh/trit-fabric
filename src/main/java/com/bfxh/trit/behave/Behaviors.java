@@ -4,7 +4,6 @@ import com.bfxh.trit.core.Channel;
 import com.bfxh.trit.core.Phase;
 import com.bfxh.trit.core.Tri;
 import com.bfxh.trit.core.Vote;
-import com.bfxh.trit.sense.Sensor;
 
 import java.util.List;
 
@@ -54,10 +53,9 @@ public final class Behaviors {
             // 有采集目标时交给 Forage，别抢方向盘
             if (c.w.resourcePos != null) return;
 
-            int wall = c.w.wall == null ? 0 : c.w.wall;
-            boolean frontBlocked = Sensor.wallAt(wall, 0);
-            boolean frontLeft = Sensor.wallAt(wall, 1) || Sensor.wallAt(wall, 7);
-            boolean frontRight = Sensor.wallAt(wall, 2) || Sensor.wallAt(wall, 6);
+            boolean frontBlocked = c.w.wallAt(0);
+            boolean frontLeft = c.w.wallAt(1) || c.w.wallAt(7);
+            boolean frontRight = c.w.wallAt(2) || c.w.wallAt(6);
 
             if (frontBlocked) {
                 // 撞墙了：不再前进，朝空的一侧转
@@ -161,8 +159,7 @@ public final class Behaviors {
             out.add(Vote.of(Channel.STRAFE, flip(c.tick), 1, "flee_juke"));
             if (c.w.step == Boolean.TRUE) out.add(Vote.of(Channel.JUMP, Tri.POS, 2, "flee_hop"));
             // 背后有墙就往旁边让，别贴着墙原地推
-            int wall = c.w.wall == null ? 0 : c.w.wall;
-            if (Sensor.wallAt(wall, 4)) {
+            if (c.w.wallAt(4)) {
                 out.add(Vote.of(Channel.STRAFE, flip(c.tick), 4, "flee_wall"));
             }
         }

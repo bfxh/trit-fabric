@@ -12,7 +12,10 @@ JAVAC = r"E:\MC\MC\meta\java_versions\mojang-java-runtime-epsilon-windows-x64-b3
 JAVA = r"E:\MC\MC\meta\java_versions\mojang-java-runtime-epsilon-windows-x64-b374544c680d\bin\java.exe"
 
 OUT = os.path.join(ROOT, "build", "test-classes")
-CORE = os.path.join(ROOT, "src", "main", "java", "com", "bfxh", "trit", "core")
+MAIN = os.path.join(ROOT, "src", "main", "java", "com", "bfxh", "trit")
+# 只编不依赖 Minecraft 的包：core 是纯逻辑，behave 只依赖 core。
+# sense / act / TritMod 要碰游戏类，不在自检范围里。
+PURE = [os.path.join(MAIN, "core"), os.path.join(MAIN, "behave")]
 TEST = os.path.join(ROOT, "src", "test", "java")
 
 
@@ -22,13 +25,12 @@ def main() -> int:
     os.makedirs(OUT, exist_ok=True)
 
     sources = []
-    for base in (CORE, TEST):
+    for base in PURE + [TEST]:
         for dirpath, _, files in os.walk(base):
             for f in files:
                 if f.endswith(".java"):
                     sources.append(os.path.join(dirpath, f))
-    # core 之外的 main 源码依赖 MC，测试不编它们
-    print(f"编译 {len(sources)} 个文件（core + test）")
+    print(f"编译 {len(sources)} 个文件（core + behave + test）")
 
     argfile = os.path.join(ROOT, "build", "test.args")
     with open(argfile, "w", encoding="utf-8") as f:
@@ -43,12 +45,17 @@ def main() -> int:
         print(r.stderr[:3000])
         return 1
 
-    run = subprocess.run([JAVA, "-cp", OUT, "com.bfxh.trit.SelfTest"],
-                         capture_output=True, text=True, encoding="utf-8", errors="replace")
-    print(run.stdout)
-    if run.stderr.strip():
-        print(run.stderr[:3000])
-    return run.returncode
+    rc = 0
+    for cls in ("com.bfxh.trit.SelfTest", "com.bfxh.trit.SimTest"):
+        print("--- " + cls + " ---")
+        run = subprocess.run([JAVA, "-cp", OUT, cls],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        print(run.stdout)
+        if run.stderr.strip():
+            print(run.stderr[:3000])
+        if run.returncode != 0:
+            rc = run.returncode
+    return rc
 
 
 if __name__ == "__main__":

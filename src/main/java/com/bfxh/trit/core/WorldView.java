@@ -89,6 +89,18 @@ public final class WorldView {
 
     public long tick;
 
+    /**
+     * 某个方位上有没有障碍。
+     *
+     * @param dir 0 = 正前，顺时针每 45°，取值 0..7（自动取模）
+     * @return true = 该方位有墙。<strong>掩码为 null（没扫描过）时返回 false</strong>，
+     *         行为模块拿到的就是「不知道」—— 想要区分请直接读 {@link #wall}。
+     */
+    public boolean wallAt(int dir) {
+        if (wall == null) return false;
+        return (wall & (1 << (dir & 7))) != 0;
+    }
+
     /** 深拷贝一份，行为模块需要在上面做「上一拍」对比。 */
     public WorldView copy() {
         WorldView c = new WorldView();
