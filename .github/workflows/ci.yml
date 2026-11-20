@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: python scripts + mod metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: compile scripts
+        run: python -m compileall -q build.py test.py diagnose.py
+      - name: validate fabric.mod.json
+        run: python -m json.tool src/main/resources/fabric.mod.json > /dev/null
+      - name: source tree is present
+        run: test -n "$(find src/main/java -name '*.java' -print -quit)"
