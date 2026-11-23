@@ -16,8 +16,34 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-JAVAC = r"E:\MC\MC\meta\java_versions\mojang-java-runtime-epsilon-windows-x64-b374544c680d\bin\javac.exe"
-JAVA = r"E:\MC\MC\meta\java_versions\mojang-java-runtime-epsilon-windows-x64-b374544c680d\bin\java.exe"
+def _find_java_tools() -> tuple[str, str]:
+    """优先用 PATH / JAVA_HOME 的 JDK；找不到再退回本机 Mojang 运行时。
+
+    CI runner 没有 E: 盘，硬编码路径会让运行时自检永远跑不起来。
+    """
+    suffixes = (".exe", "") if os.name == "nt" else ("",)
+    home = os.environ.get("JAVA_HOME", "")
+    candidates = []
+    if home:
+        candidates.append(os.path.join(home, "bin"))
+    for name in ("javac", "java"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(os.path.dirname(found))
+    for directory in candidates:
+        javac = next((os.path.join(directory, "javac" + s) for s in suffixes
+                      if os.path.isfile(os.path.join(directory, "javac" + s))), "")
+        java = next((os.path.join(directory, "java" + s) for s in suffixes
+                     if os.path.isfile(os.path.join(directory, "java" + s))), "")
+        if javac and java:
+            return javac, java
+    fallback = r"E:\MC\MC\meta\java_versions\mojang-java-runtime-epsilon-windows-x64-b374544c680d\bin"
+    return os.path.join(fallback, "javac.exe"), os.path.join(fallback, "java.exe")
+
+
+JAVAC, JAVA = _find_java_tools()
+if not os.path.isfile(JAVAC):
+    raise SystemExit("找不到 javac：请安装 JDK 并设置 JAVA_HOME，或把 JDK 的 bin 加入 PATH")
 
 OUT = os.path.join(ROOT, "build", "test-classes")
 MAIN = os.path.join(ROOT, "src", "main", "java", "com", "bfxh", "trit")

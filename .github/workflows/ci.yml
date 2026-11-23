@@ -27,3 +27,17 @@ jobs:
         run: python -m json.tool src/main/resources/fabric.mod.json > /dev/null
       - name: source tree is present
         run: test -n "$(find src/main/java -name '*.java' -print -quit)"
+
+  runtime:
+    name: runtime self-test (pure Java)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      # core/behave/neo 不碰 Minecraft 类，runner 上可以直接编译并跑三组自检。
+      - name: compile + run self-tests
+        run: python test.py
